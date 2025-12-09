@@ -3,16 +3,41 @@ import re
 import json
 import torch
 import requests
+import logging
+from time import sleep
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
+from webdriver_manager.chrome import ChromeDriverManager
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-print("[Model] Loading pretrained FLAN-T5 model...")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("scraper.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger(__name__)
+
+START_URL = "https://www.diamondvalleyhonda.com/new-inventory/index.htm"
+MAX_PAGES = 50
+MAX_CATEGORIES = 20
+CHUNK_SIZE = 800
+REQUEST_TIMEOUT = 15
+REQUEST_RETRIES = 3
+REQUEST_BACKOFF = 1.5
+SELENIUM_TIMEOUT = 120
+USER_AGENT = "Mozilla/5.0"
+
+logger.info("[Model] Loading pretrained FLAN-T5 model...")
 tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-xl")
 model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-xl")
 
@@ -20,39 +45,52 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 model.to(device)
 model.eval()
 
-print(f"[Model] Ready on {device}, vocab size = {len(tokenizer)}")
+logger.info("[Model] Ready on %s, vocab size = %s", device, len(tokenizer))
 
-
-print("torch version       :", torch.__version__)
-print("CUDA available?     :", torch.cuda.is_available())
-print("CUDA device count   :", torch.cuda.device_count())
+logger.info("torch version       : %s", torch.__version__)
+logger.info("CUDA available?     : %s", torch.cuda.is_available())
+logger.info("CUDA device count   : %s", torch.cuda.device_count())
 if torch.cuda.is_available():
-    print("Current device name :", torch.cuda.get_device_name(0))
-    print("CUDA toolkit version:", torch.version.cuda)
+    logger.info("Current device name : %s", torch.cuda.get_device_name(0))
+    logger.info("CUDA toolkit version: %s", torch.version.cuda)
 
 
-def fetch_listing_html(url, timeout=15):
-    """Try loading a URL via requests."""
-    try:
-        resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-        return resp.text
-    except Exception as e:
-        print(f"Failed to load listing via requests: {e}")
-        return None
+def fetch_listing_html(url, timeout=REQUEST_TIMEOUT):
+    """Try loading a URL via requests with basic retries/backoff."""
+    for attempt in range(1, REQUEST_RETRIES + 1):
+        try:
+            resp = requests.get(
+                url,
+                timeout=timeout,
+                headers={"User-Agent": USER_AGENT},
+            )
+            resp.raise_for_status()
+            return resp.text
+        except Exception as e:
+            logger.warning(
+                "Failed to load listing via requests (attempt %s/%s): %s",
+                attempt,
+                REQUEST_RETRIES,
+                e,
+            )
+            if attempt < REQUEST_RETRIES:
+                sleep(REQUEST_BACKOFF * attempt)
+    return None
 
 
-def fetch_html_with_selenium(url, timeout=120):
+def fetch_html_with_selenium(url, timeout=SELENIUM_TIMEOUT):
     """Load URL using Selenium (headless Chrome)."""
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
     options.page_load_strategy = "eager"
 
-    print(f"[Browser] Loading: {url}")
-    driver = webdriver.Chrome(options=options)
+    logger.info("[Browser] Loading: %s", url)
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
 
     try:
         driver.set_page_load_timeout(timeout)
@@ -64,9 +102,9 @@ def fetch_html_with_selenium(url, timeout=120):
         )
 
         html = driver.page_source
-        print(f"[Browser] ✅ Page loaded successfully ({len(html)} chars)")
+        logger.info("[Browser] ✅ Page loaded successfully (%s chars)", len(html))
     except Exception as e:
-        print(f"❌ Failed to load {url}: {e}")
+        logger.error("❌ Failed to load %s: %s", url, e)
         html = None
     finally:
         driver.quit()
@@ -901,7 +939,7 @@ def discover_additional_inventory_urls(base_url):
     return patterns
 
 
-def main_scraper(url, max_pages=50, max_categories=20):
+def main_scraper(url, max_pages=MAX_PAGES, max_categories=MAX_CATEGORIES):
     """
     Enhanced main scraper with comprehensive pagination and category discovery
 
@@ -1012,7 +1050,7 @@ def main_scraper(url, max_pages=50, max_categories=20):
                     continue
 
                 html_chunks = get_vehicle_text_chunks_from_html(
-                    page_html, chunk_size=800
+                    page_html, chunk_size=CHUNK_SIZE
                 )
                 print(f"  → got {len(html_chunks)} chunks")
 
@@ -1068,7 +1106,7 @@ def main_scraper(url, max_pages=50, max_categories=20):
 
 if __name__ == "__main__":
     main_scraper(
-        "https://www.diamondvalleyhonda.com/new-inventory/index.htm",
-        max_pages=50,
-        max_categories=20,
+        START_URL,
+        max_pages=MAX_PAGES,
+        max_categories=MAX_CATEGORIES,
     )

@@ -113,3 +113,7 @@ websocket-client==1.8.0
 wsproto==1.2.0
 yarg==0.1.9
 zope.interface==7.2
+torch==2.4.1
+transformers==4.46.2
+webdriver-manager==4.0.2
+torch==2.4.1
