@@ -116,4 +116,5 @@ zope.interface==7.2
 torch==2.4.1
 transformers==4.46.2
 webdriver-manager==4.0.2
-torch==2.4.1
+torch==2.4.1sentencepiece
+accelerate

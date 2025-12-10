@@ -16,7 +16,7 @@ from selenium.webdriver.common.by import By
 from webdriver_manager.chrome import ChromeDriverManager
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -27,6 +27,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Configuration
 START_URL = "https://www.diamondvalleyhonda.com/new-inventory/index.htm"
 MAX_PAGES = 50
 MAX_CATEGORIES = 20
@@ -37,22 +38,35 @@ REQUEST_BACKOFF = 1.5
 SELENIUM_TIMEOUT = 120
 USER_AGENT = "Mozilla/5.0"
 
-logger.info("[Model] Loading pretrained FLAN-T5 model...")
-tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-xl")
-model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-xl")
+# Global variables for lazy loading
+_tokenizer = None
+_model = None
+_device = None
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model.to(device)
-model.eval()
-
-logger.info("[Model] Ready on %s, vocab size = %s", device, len(tokenizer))
-
-logger.info("torch version       : %s", torch.__version__)
-logger.info("CUDA available?     : %s", torch.cuda.is_available())
-logger.info("CUDA device count   : %s", torch.cuda.device_count())
-if torch.cuda.is_available():
-    logger.info("Current device name : %s", torch.cuda.get_device_name(0))
-    logger.info("CUDA toolkit version: %s", torch.version.cuda)
+def get_model():
+    """Lazy load the model and tokenizer only when needed."""
+    global _tokenizer, _model, _device
+    if _model is None:
+        logger.info("[Model] Loading pretrained FLAN-T5 model (Lite version)...")
+        # Switched to flan-t5-large for speed. Use 'xl' only if quality is poor.
+        model_name = "google/flan-t5-large"
+        try:
+            _tokenizer = AutoTokenizer.from_pretrained(model_name)
+            # Use device_map="auto" if accelerate is installed, otherwise manual
+            if torch.cuda.is_available():
+                _device = "cuda"
+            else:
+                _device = "cpu"
+                
+            _model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+            _model.to(_device)
+            _model.eval()
+            
+            logger.info("[Model] Ready on %s, vocab size = %s", _device, len(_tokenizer))
+        except Exception as e:
+            logger.error(f"Failed to load model {model_name}: {e}")
+            raise
+    return _tokenizer, _model, _device
 
 
 def fetch_listing_html(url, timeout=REQUEST_TIMEOUT):
@@ -161,17 +175,8 @@ def extract_vehicle_links(html, base_url):
     return list(links)
 
 
-def query_flant5(prompt):
-    """
-    Sends a prompt to FLAN-T5 and safely converts the response into valid JSON.
-    """
-    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
-    outputs = model.generate(
-        inputs["input_ids"], max_length=1024, num_beams=5, early_stopping=True
-    )
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-    print(f"Raw response from FLAN-T5: {response}")
-
+def clean_and_parse_json(response):
+    """Clean the raw LLM response and attempt to parse it as JSON."""
     cleaned = response.strip()
 
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.MULTILINE)
@@ -187,57 +192,38 @@ def query_flant5(prompt):
     if not cleaned.endswith("}"):
         cleaned = cleaned + " }"
 
+    # Fix common JSON syntax errors
     cleaned = cleaned.replace("$", "")
-    cleaned = cleaned.replace(""", '"').replace(""", '"').replace("'", "'")
-    cleaned = cleaned.replace("'", "'").replace(""", '"').replace(""", '"')
-
+    # unify quotes (dumb replacement but effective for simple cases)
+    cleaned = cleaned.replace(""", '"').replace(""", '"').replace("'", '"') 
+    
+    # Try to quote unquoted keys
     cleaned = re.sub(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:", r'\1"\2":', cleaned)
-    cleaned = re.sub(r":\s*([A-Za-z_][A-Za-z0-9_]*)\s*([,}])", r': "\1"\2', cleaned)
+    
+    # Fix trailing commas
     cleaned = re.sub(r",\s*}", "}", cleaned)
     cleaned = re.sub(r",\s*]", "]", cleaned)
+    
+    # Fix objects stuck together
     cleaned = re.sub(r"}\s*{", "},{", cleaned)
 
-    cleaned = re.sub(r":\s*true\s*([,}])", r": true\1", cleaned)
-    cleaned = re.sub(r":\s*false\s*([,}])", r": false\1", cleaned)
-    cleaned = re.sub(r":\s*null\s*([,}])", r": null\1", cleaned)
-
-    if '"options":' in cleaned and not re.search(r'"options":\s*\{[^}]*\}', cleaned):
-        options_match = re.search(r'"options":\s*([^}]+?)(?=,|$)', cleaned)
-        if options_match:
-            options_content = options_match.group(1).strip()
-            if not options_content.startswith("{"):
-                cleaned = re.sub(
-                    r'"options":\s*[^}]+?(?=,|$)', '"options": {}', cleaned
-                )
-            else:
-                cleaned = cleaned.replace(options_content, options_content + "}")
-
-    if '"options":' not in cleaned or re.search(r'"options":\s*\{\s*\}', cleaned):
-        cleaned = re.sub(
-            r'"options":\s*\{\s*\}',
-            '"options": {"trim": "Unknown", "bodyStyle": "Unknown", "doors": "Unknown", "engine": "Unknown", "transmission": "Unknown", "drivetrain": "Unknown", "mpgCity": "Unknown", "mpgHighway": "Unknown", "seatingCapacity": "Unknown", "safetyFeatures": [], "techFeatures": [], "interiorFeatures": [], "exteriorFeatures": [], "performanceFeatures": [], "standardEquipment": [], "optionalEquipment": []}',
-            cleaned,
-        )
+    # Boolean/Null fixes
+    cleaned = re.sub(r":\s*true\s*([,}])", r": true\1", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r":\s*false\s*([,}])", r": false\1", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r":\s*null\s*([,}])", r": null\1", cleaned, flags=re.IGNORECASE)
 
     try:
-        vehicle_data = json.loads(cleaned)
-        print("✅ JSON parsed successfully!")
-        return vehicle_data
-    except json.JSONDecodeError as e:
-        print(f"[Error] JSON decode failed: {e}")
-        print(f"Cleaned response was:\n{cleaned}")
-
+        data = json.loads(cleaned)
+        return data
+    except json.JSONDecodeError:
+        # Last ditch effort: find anything that looks like JSON
         try:
             json_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
             if json_match:
-                alt_cleaned = json_match.group(0)
-                vehicle_data = json.loads(alt_cleaned)
-                print("✅ JSON parsed successfully with alternative method!")
-                return vehicle_data
+                return json.loads(json_match.group(0))
         except:
             pass
-
-        return {"error": "Failed to parse response", "raw_response": response}
+        return None
 
 
 def get_vehicle_text_chunks_from_html(html, chunk_size=2000):
@@ -289,8 +275,6 @@ def extract_vehicle_data_from_raw_text(raw_text, vehicle_id, vehicle_url):
     This function receives raw vehicle listing text and processes it to extract the relevant fields.
     It returns the structured data in the required JSON format using direct regex extraction.
     """
-    print(f"🔍 Extracting vehicle data using direct pattern matching...")
-
     make = "Unknown"
     model = "Unknown"
     year = 0
@@ -608,107 +592,66 @@ def extract_vehicle_data_from_raw_text(raw_text, vehicle_id, vehicle_url):
             "optionalEquipment": optional_equipment,
         },
     }
-
-    print(f"✅ Vehicle #{vehicle_id}: Direct extraction completed")
     return vehicle_data
 
 
-def extract_with_flan(vehicle_id, vehicle_url, text):
+def extract_with_flan(vehicle_id, vehicle_url, text, current_data=None):
     """
     Use local FLAN-T5 model to dynamically extract structured vehicle data as JSON.
-    Works without API keys.
+    This is a fallback/enhancement method when regex fails.
     """
+    logger.info(f"🧠 Invoking FLAN-T5 for vehicle #{vehicle_id}...")
+    tokenizer, model, device = get_model()
+
+    # Prompt
     prompt = f"""
-    Extract vehicle information and return ONLY a valid JSON object. No explanations, no markdown, no extra text.
+    Extract vehicle specifications from the text below and return strictly valid JSON.
+    
+    Keys required: make, model, year, price, mileage, color, vin, bodyStyle, engine, transmission.
+    If unknown, use "Unknown" or 0.
 
-    JSON format:
-    {{
-    "id": {vehicle_id},
-    "make": "Unknown",
-    "model": "Unknown",
-    "year": 0,
-    "price": 0.0,
-    "mileage": 0,
-    "color": "Unknown",
-    "vin": "",
-    "stockNumber": "",
-    "condition": "new",
-    "detail_url": "{vehicle_url}",
-    "options": {{
-        "trim": "Unknown",
-        "bodyStyle": "",
-        "doors": "Unknown",
-        "engine": "Unknown",
-        "engineSize": "Unknown",
-        "horsepower": "Unknown",
-        "torque": "Unknown",
-        "transmission": "Unknown",
-        "drivetrain": "Unknown",
-        "fuelType": "Unknown",
-        "fuelCapacity": "Unknown",
-        "mpgCity": "Unknown",
-        "mpgHighway": "Unknown",
-        "seatingCapacity": "Unknown",
-        "cargoCapacity": "Unknown",
-        "wheelbase": "Unknown",
-        "length": "Unknown",
-        "width": "Unknown",
-        "height": "Unknown",
-        "curbWeight": "Unknown",
-        "groundClearance": "Unknown",
-        "safetyFeatures": [],
-        "techFeatures": [],
-        "interiorFeatures": [],
-        "exteriorFeatures": [],
-        "performanceFeatures": [],
-        "standardEquipment": [],
-        "optionalEquipment": []
-    }}
-    }}
-
-    Rules: Use double quotes, use "Unknown" for missing strings, 0 for missing numbers, empty arrays for missing lists, return only JSON.
-
-    Vehicle listing text:
-    {text}
+    Text:
+    {text[:1500]}
+    
+    JSON:
     """
 
     inputs = tokenizer(
         prompt, return_tensors="pt", truncation=True, max_length=1024
     ).to(device)
-    outputs = model.generate(
-        **inputs, max_length=1024, num_beams=2, early_stopping=True
-    )
-    decoded = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+    
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs, 
+            max_length=512, 
+            num_beams=3,
+            early_stopping=True
+        )
+    
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+    # logger.debug(f"Raw LLM response: {response}")
 
-    try:
-        data = query_flant5(prompt)
-        if "error" not in data:
-            print(f"✅ Vehicle #{vehicle_id}: structured JSON parsed successfully")
-            return data
-        else:
-            raise Exception("JSON parsing failed")
-    except Exception:
-        print(f"⚠️ Vehicle #{vehicle_id}: Could not parse JSON, saving fallback text.")
-        print("Raw vehicle data:", text[:500])
-        return {"id": vehicle_id, "detail_url": vehicle_url, "raw_text": text[:500]}
-
-
-def merge_vehicle_data(results):
-    """Merge partial vehicle data chunks safely."""
-    if not results:
-        return None
-
-    valid = [r for r in results if isinstance(r, dict)]
-    if not valid:
-        return None
-
-    merged = valid[0].copy()
-
-    for data in valid[1:]:
-        for key, val2 in data.items():
-            if key not in merged or not merged[key]:
-                merged[key] = val2
-    return merged
+    data = clean_and_parse_json(response)
+    
+    if data:
+        # Merge with current_data if provided
+        if current_data:
+            # We trust LLM to fill in gaps, but maybe Regex is more precise for numbers.
+            # Let's simple fill unknowns
+            for k, v in data.items():
+                if k in current_data:
+                    is_unknown = current_data[k] in [None, "Unknown", 0, "", "0"]
+                    if is_unknown and v not in [None, "Unknown", 0, ""]:
+                       current_data[k] = v
+            return current_data
+        
+        return {
+            "id": vehicle_id,
+            "detail_url": vehicle_url,
+            **data
+        }
+    
+    return current_data 
 
 
 def get_next_page_url(html, base_url):
@@ -942,11 +885,6 @@ def discover_additional_inventory_urls(base_url):
 def main_scraper(url, max_pages=MAX_PAGES, max_categories=MAX_CATEGORIES):
     """
     Enhanced main scraper with comprehensive pagination and category discovery
-
-    Args:
-        url: Starting URL for the inventory page
-        max_pages: Maximum number of pages to scrape per category (safety limit)
-        max_categories: Maximum number of categories to process (safety limit)
     """
     output_file = "vehicle_inventory.json"
     with open(output_file, "w", encoding="utf-8") as f:
@@ -980,10 +918,11 @@ def main_scraper(url, max_pages=MAX_PAGES, max_categories=MAX_CATEGORIES):
 
         total_discovered = len(discovered_categories) + len(additional_patterns)
         print(f"📊 Total categories to process: {total_discovered}")
-        for i, cat in enumerate(categories_to_process[:15], 1):
+        # Only print first few
+        for i, cat in enumerate(categories_to_process[:5], 1):
             print(f"  {i}. {cat}")
-        if len(categories_to_process) > 15:
-            print(f"  ... and {len(categories_to_process) - 15} more")
+        if len(categories_to_process) > 5:
+            print(f"  ... and {len(categories_to_process) - 5} more")
 
     category_count = 0
     for category_url in categories_to_process:
@@ -998,7 +937,7 @@ def main_scraper(url, max_pages=MAX_PAGES, max_categories=MAX_CATEGORIES):
         processed_categories.add(category_url)
 
         print(f"\n{'='*60}")
-        print(f"📂 PROCESSING CATEGORY {category_count}/{len(categories_to_process)}")
+        print(f"📂 PROCESSING CATEGORY {category_count}")
         print(f"🌐 Category URL: {category_url}")
         print(f"{'='*60}")
 
@@ -1007,7 +946,7 @@ def main_scraper(url, max_pages=MAX_PAGES, max_categories=MAX_CATEGORIES):
         category_vehicles = 0
 
         while current_page_url and page_number <= max_pages:
-            print(f"\n📄 Processing page {page_number} of category {category_count}...")
+            print(f"\n📄 Processing page {page_number}...")
             print(f"🔗 URL: {current_page_url}")
 
             if current_page_url in processed_urls:
@@ -1021,9 +960,9 @@ def main_scraper(url, max_pages=MAX_PAGES, max_categories=MAX_CATEGORIES):
                 print(f"❌ Failed to load page: {current_page_url}")
                 break
 
-            print(f"🔍 Extracting vehicle links...")
+            # print(f"🔍 Extracting vehicle links...")
             vehicle_links = extract_vehicle_links(inventory_html, current_page_url)
-            print(f"🔗 Found {len(vehicle_links)} vehicle detail links")
+            # print(f"🔗 Found {len(vehicle_links)} vehicle detail links")
 
             if not vehicle_links:
                 print(f"⚠️ No vehicle links found, moving to next page")
@@ -1052,22 +991,36 @@ def main_scraper(url, max_pages=MAX_PAGES, max_categories=MAX_CATEGORIES):
                 html_chunks = get_vehicle_text_chunks_from_html(
                     page_html, chunk_size=CHUNK_SIZE
                 )
-                print(f"  → got {len(html_chunks)} chunks")
-
+                
+                # Use only first 2 chunks for efficiency (listing is usually top)
                 all_raw_text = ""
-                for chunk_num, chunk in enumerate(html_chunks, start=1):
-                    print(f"  Accumulating chunk {chunk_num}/{len(html_chunks)}...")
+                for chunk in html_chunks[:3]:
                     all_raw_text += chunk + "\n"
 
-                print(f"\n🚗 Extracting structured data...")
+                # print(f"  > Extracting structured data (Regex)...")
                 vehicle_data = extract_vehicle_data_from_raw_text(
                     all_raw_text, total_vehicles + 1, vehicle_url
                 )
 
-                if vehicle_data:
-                    print("VEHICLE SCRAPED")
-                    print(json.dumps(vehicle_data, indent=2, ensure_ascii=False))
+                # Quality Check
+                is_low_quality = (
+                    vehicle_data["price"] == 0.0 or 
+                    vehicle_data["make"] == "Unknown" or 
+                    vehicle_data["year"] == 0
+                )
+                
+                if is_low_quality:
+                    print("  ⚠️ Low quality extraction (missing information). Enhancing with LLM...")
+                    try:
+                        vehicle_data = extract_with_flan(total_vehicles + 1, vehicle_url, all_raw_text, current_data=vehicle_data)
+                        print("  ✨ LLM enhancement successful.")
+                    except Exception as e:
+                        print(f"  ❌ LLM failed: {e}")
 
+                if vehicle_data:
+                    # Print summary
+                    print(f"  ✔ Results: {vehicle_data.get('year')} {vehicle_data.get('make')} {vehicle_data.get('model')} - ${vehicle_data.get('price')}")
+                    
                     with open(output_file, "a", encoding="utf-8") as f:
                         if not first:
                             f.write(",\n")
@@ -1075,13 +1028,12 @@ def main_scraper(url, max_pages=MAX_PAGES, max_categories=MAX_CATEGORIES):
                         first = False
                     total_vehicles += 1
                     category_vehicles += 1
-                    print(f"  ✔ Saved vehicle #{total_vehicles}")
 
             print(f"\n🔍 Looking for next page in category...")
             next_page_url = get_next_page_url(inventory_html, current_page_url)
 
             if next_page_url:
-                print(f"✅ Found next page: {next_page_url}")
+                # print(f"✅ Found next page: {next_page_url}")
                 current_page_url = next_page_url
                 page_number += 1
             else:
