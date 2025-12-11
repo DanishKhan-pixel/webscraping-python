@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import json
 import torch
 import requests
@@ -28,7 +29,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-START_URL = "https://www.diamondvalleyhonda.com/new-inventory/index.htm"
+# Configuration
+# You can override this via command line argument: python scrapper.py "https://yoursite.com"
+DEFAULT_START_URL = "https://www.diamondvalleyhonda.com/new-inventory/index.htm"
+START_URL = DEFAULT_START_URL
 MAX_PAGES = 50
 MAX_CATEGORIES = 20
 CHUNK_SIZE = 800
@@ -143,30 +147,37 @@ def extract_vehicle_links(html, base_url):
 
         full_url = urljoin(base_url, href)
 
+        # Generic patterns for vehicle detail pages found on most dealer sites
         vehicle_patterns = [
-            r"/(new|used)/[A-Za-z\-]+/\d{4}-[A-Za-z0-9\-]+-[a-f0-9]+\.htm",
-            r"/(new|used)/[A-Za-z\-]+/\d{4}-[A-Za-z0-9\-]+\.htm",
-            r"/(new|used)/[A-Za-z\-]+/\d{4}-[A-Za-z0-9\-]+.*\.htm",
-            r"/new/[A-Za-z\-]+/\d{4}-[A-Za-z0-9\-]+.*\.htm",
-            r"/used/[A-Za-z\-]+/\d{4}-[A-Za-z0-9\-]+.*\.htm",
+            r"/(?:new|used|certified|inventory)/[^/]+/[0-9]{4}-", # Common: /new/Ford/2024-...
+            r"/(?:new|used|certified|inventory)/[^/]+/id", # Common: /inventory/make/model/id/...
+            r"/(?:vehicle-details|detail)/", # Common: /vehicle-details/...
+            r"/[0-9]{4}-[a-zA-Z0-9\-]+-[0-9a-fA-F]+", # Year-Make-Model-Hash
+            r"/[0-9]{4}-[a-zA-Z0-9\-]+\.htm", # Year-Make-Model.htm
+            r"view/details/",
+            r"type=(?:new|used)",
         ]
 
-        general_vehicle_patterns = [
-            r".*civic.*\.htm",
-            r".*accord.*\.htm",
+        # Exclude common non-vehicle pages
+        exclude_patterns = [
+            r"/search", r"/compare", r"/promotion", r"/specials", r"/service", r"/parts", 
+            r"/financing", r"/about", r"/contact", r"/login", r"print", r"email"
         ]
+
+        is_excluded = any(re.search(p, href, re.IGNORECASE) for p in exclude_patterns)
+        if is_excluded:
+            continue
 
         is_vehicle_link = False
         for pattern in vehicle_patterns:
             if re.search(pattern, href, re.IGNORECASE):
                 is_vehicle_link = True
                 break
-
+        
+        # Heuristic: URL contains Year and specific keywords usually implies a car listing
         if not is_vehicle_link:
-            for pattern in general_vehicle_patterns:
-                if re.search(pattern, href, re.IGNORECASE):
-                    is_vehicle_link = True
-                    break
+            if re.search(r"20[0-2][0-9]", href) and any(x in href.lower() for x in ["new", "used", "inventory", "detail"]):
+                is_vehicle_link = True
 
         if is_vehicle_link:
             links.add(full_url)
@@ -273,7 +284,7 @@ def get_vehicle_text_chunks_from_html(html, chunk_size=2000):
 def extract_vehicle_data_from_raw_text(raw_text, vehicle_id, vehicle_url):
     """
     This function receives raw vehicle listing text and processes it to extract the relevant fields.
-    It returns the structured data in the required JSON format using direct regex extraction.
+    It returns the structured data in the required JSON format using generic regex extraction.
     """
     make = "Unknown"
     model = "Unknown"
@@ -313,241 +324,108 @@ def extract_vehicle_data_from_raw_text(raw_text, vehicle_id, vehicle_url):
     standard_equipment = []
     optional_equipment = []
 
-    if "Honda" in raw_text:
-        make = "Honda"
+    # Generic Make/Model detection looking for labels
+    # e.g. "Make: Toyota", "Model: Camry"
+    make_match = re.search(r"(?:Make|Manufacturer):\s*([A-Za-z0-9\-]+)", raw_text, re.IGNORECASE)
+    if make_match:
+        make = make_match.group(1).strip()
+    
+    model_match = re.search(r"Model:\s*([A-Za-z0-9\-\s]+?)(?:\n|$)", raw_text, re.IGNORECASE)
+    if model_match:
+        model = model_match.group(1).strip()
+    
+    # Try textual patterns (e.g. "2024 Honda Civic")
+    # This acts as a backup if explicit labels aren't found
+    if make == "Unknown" or model == "Unknown":
+        header_match = re.search(r"(20[0-2][0-9])\s+([A-Z][a-z]+)\s+([A-Z0-9][a-zA-Z0-9\-\s]+)", raw_text)
+        if header_match:
+            if year == 0: year = int(header_match.group(1))
+            if make == "Unknown": make = header_match.group(2)
+            # Rough guess for model, might include trim
+            if model == "Unknown": model = header_match.group(3).split("\n")[0].strip()
 
-    model_patterns = [
-        "Civic",
-        "Accord",
-        "CR-V",
-        "Pilot",
-        "HR-V",
-        "Passport",
-        "Ridgeline",
-        "Odyssey",
-        "Insight",
-    ]
-    for pattern in model_patterns:
-        if pattern in raw_text:
-            model = pattern
+    year_match = re.search(r"20(2[0-9])|20(1[0-9])|20(0[0-9])", raw_text)
+    if year_match and year == 0:
+        # Construct the full year from the groups
+        y_str = year_match.group(0)
+        year = int(y_str)
+
+    # Price: look for larger numbers with $ sign, picking the first reasonable one
+    price_matches = re.finditer(r"\$([0-9]{1,3}(?:,[0-9]{3})*)", raw_text)
+    for pm in price_matches:
+        p_val = float(pm.group(1).replace(",", ""))
+        if p_val > 1000: # filter out small prices like accessories
+            price = p_val
             break
 
-    year_match = re.search(r"20(2[0-9])", raw_text)
-    if year_match:
-        year = int("20" + year_match.group(1))
+    # Mileage
+    mileage_match = re.search(r"(?:Mileage|Odometer):\s*([0-9,]+)", raw_text, re.IGNORECASE)
+    if mileage_match:
+        mileage = int(mileage_match.group(1).replace(",", ""))
+    else:
+        # Look for "XX,XXX miles" patterns
+        m_match = re.search(r"([0-9,]{1,7})\+?\s*(?:miles|mi\.)", raw_text, re.IGNORECASE)
+        if m_match:
+            try:
+                mileage = int(m_match.group(1).replace(",", ""))
+            except:
+                pass
 
-    price_match = re.search(r"\$([0-9,]+)", raw_text)
-    if price_match:
-        price = float(price_match.group(1).replace(",", ""))
+    # Color
+    color_match = re.search(r"(?:Exterior Color|Color):\s*([A-Za-z\s]+)", raw_text, re.IGNORECASE)
+    if color_match:
+        color = color_match.group(1).strip()
 
-    color_patterns = [
-        "Solar Silver",
-        "Crystal Black Pearl",
-        "Rallye Red",
-        "Platinum White Pearl",
-        "Black",
-        "White",
-        "Silver",
-        "Blue",
-        "Red",
-        "Gray",
-        "Grey",
-    ]
-    for color_pattern in color_patterns:
-        if color_pattern in raw_text:
-            color = color_pattern
-            break
-
-    interior_color = "Unknown"
-    if "Interior Color" in raw_text:
-        interior_match = re.search(r"Interior Color\s*\n\s*([^\n]+)", raw_text)
-        if interior_match:
-            interior_color = interior_match.group(1).strip()
-
+    # VIN
     vin_match = re.search(r"[A-HJ-NPR-Z0-9]{17}", raw_text)
     if vin_match:
         vin = vin_match.group(0)
 
-    stock_match = re.search(r"Stock Number\s*([A-Z0-9]+)", raw_text)
+    # Stock Number
+    stock_match = re.search(r"(?:Stock Number|Stock #|Stock No\.?):\s*([A-Z0-9\-]+)", raw_text, re.IGNORECASE)
     if stock_match:
-        stock_number = stock_match.group(1)
+        stock_number = stock_match.group(1).strip()
 
-    trim_patterns = ["LX", "EX", "Sport", "Touring", "Type R", "Si"]
-    for pattern in trim_patterns:
-        if pattern in raw_text:
-            trim = pattern
-            break
+    # Trim
+    trim_match = re.search(r"Trim:\s*([A-Za-z0-9\-\s]+)", raw_text, re.IGNORECASE)
+    if trim_match:
+        trim = trim_match.group(1).strip()
 
-    body_style_patterns = ["Sedan", "SUV", "Hatchback", "Coupe", "Convertible", "Wagon"]
-    for pattern in body_style_patterns:
-        if pattern in raw_text:
-            body_style = pattern
-            break
+    # Body Style
+    body_match = re.search(r"(?:Body Style|Body):\s*([A-Za-z\s]+)", raw_text, re.IGNORECASE)
+    if body_match:
+        body_style = body_match.group(1).strip()
 
-    doors_match = re.search(r"(\d+)\s*doors?", raw_text)
-    if doors_match:
-        doors = doors_match.group(1)
-    elif "Sedan" in raw_text:
-        doors = "4"
-    elif "SUV" in raw_text or "Hatchback" in raw_text:
-        doors = "5"
+    # Transmission
+    trans_match = re.search(r"(?:Transmission|Trans):\s*([A-Za-z0-9\-\s\.]+)", raw_text, re.IGNORECASE)
+    if trans_match:
+        transmission = trans_match.group(1).strip()
 
-    engine_patterns = ["I-4 cyl", "V6", "V8", "2.0L", "1.5L", "3.5L", "Turbo"]
-    for pattern in engine_patterns:
-        if pattern in raw_text:
-            engine = pattern
-            break
+    # Engine
+    eng_match = re.search(r"Engine:\s*([A-Za-z0-9\-\s\.]+)", raw_text, re.IGNORECASE)
+    if eng_match:
+        engine = eng_match.group(1).strip()
 
-    engine_size_match = re.search(r"Engine liters:\s*([0-9.]+L)", raw_text)
-    if engine_size_match:
-        engine_size = engine_size_match.group(1)
+    # Drivetrain
+    drive_match = re.search(r"(?:Drivetrain|Drive Type):\s*([A-Za-z0-9\-\s]+)", raw_text, re.IGNORECASE)
+    if drive_match:
+        drivetrain = drive_match.group(1).strip()
 
-    hp_match = re.search(r"Horsepower:\s*([0-9]+)hp", raw_text)
-    if hp_match:
-        horsepower = hp_match.group(1) + "hp"
-
-    torque_match = re.search(r"Torque:\s*([0-9]+)\s*lb\.-ft\.", raw_text)
-    if torque_match:
-        torque = torque_match.group(1) + " lb.-ft."
-
-    transmission_patterns = [
-        "CVT",
-        "Automatic",
-        "Manual",
-        "6-speed",
-        "8-speed",
-        "9-speed",
-    ]
-    for pattern in transmission_patterns:
-        if pattern in raw_text:
-            transmission = pattern
-            break
-
-    drivetrain_patterns = [
-        "Front-Wheel Drive",
-        "All-Wheel Drive",
-        "Rear-Wheel Drive",
-        "4WD",
-        "AWD",
-        "FWD",
-        "RWD",
-    ]
-    for pattern in drivetrain_patterns:
-        if pattern in raw_text:
-            drivetrain = pattern
-            break
-
-    mpg_match = re.search(r"(\d+)/(\d+)\s*MPG", raw_text)
-    if mpg_match:
-        mpg_city = mpg_match.group(1)
-        mpg_highway = mpg_match.group(2)
-
-    seating_match = re.search(r"(\d+)\s*seats?", raw_text)
-    if seating_match:
-        seating_capacity = seating_match.group(1)
-
-    if "Gasoline" in raw_text or "Gas" in raw_text:
-        fuel_type = "Gasoline"
-    elif "Hybrid" in raw_text:
-        fuel_type = "Hybrid"
-    elif "Electric" in raw_text or "EV" in raw_text:
-        fuel_type = "Electric"
-
-    fuel_cap_match = re.search(r"Fuel tank capacity:\s*([0-9.]+)gal\.", raw_text)
-    if fuel_cap_match:
-        fuel_capacity = fuel_cap_match.group(1) + " gal."
-
-    length_match = re.search(
-        r'Exterior length:\s*([0-9,]+)mm\s*\(([0-9.]+)"\)', raw_text
-    )
-    if length_match:
-        length = length_match.group(2) + '"'
-
-    width_match = re.search(
-        r'Exterior body width:\s*([0-9,]+)mm\s*\(([0-9.]+)"\)', raw_text
-    )
-    if width_match:
-        width = width_match.group(2) + '"'
-
-    height_match = re.search(
-        r'Exterior height:\s*([0-9,]+)mm\s*\(([0-9.]+)"\)', raw_text
-    )
-    if height_match:
-        height = height_match.group(2) + '"'
-
-    wheelbase_match = re.search(r'Wheelbase:\s*([0-9,]+)mm\s*\(([0-9.]+)"\)', raw_text)
-    if wheelbase_match:
-        wheelbase = wheelbase_match.group(2) + '"'
-
-    weight_match = re.search(r"Curb weight:\s*([0-9,]+)kg\s*\(([0-9,]+)lbs\)", raw_text)
-    if weight_match:
-        curb_weight = weight_match.group(2) + " lbs"
-
-    cargo_match = re.search(
-        r"Interior.*cargo volume:\s*([0-9]+)\s*L\s*\(([0-9.]+)\s*cu\.ft\.\)", raw_text
-    )
-    if cargo_match:
-        cargo_capacity = cargo_match.group(2) + " cu.ft."
-
-    feature_keywords = {
-        "safety": [
-            "Lane departure",
-            "ABS",
-            "Traction control",
-            "Airbags",
-            "Blind spot",
-            "Collision",
-            "Safety",
-        ],
-        "tech": [
-            "Wireless phone connectivity",
-            "Exterior parking camera",
-            "Navigation",
-            "Bluetooth",
-            "USB",
-            "Touchscreen",
-        ],
-        "interior": [
-            "Automatic temperature control",
-            "Steering wheel mounted audio controls",
-            "Leather",
-            "Heated seats",
-        ],
-        "exterior": [
-            "Auto high-beam headlights",
-            "Fully automatic headlights",
-            "LED",
-            "Fog lights",
-        ],
-        "performance": [
-            "Speed-sensing steering",
-            "Four wheel independent suspension",
-            "Sport mode",
-        ],
-        "standard": [
-            "4 Speakers",
-            "AM/FM radio",
-            "Air Conditioning",
-            "Power steering",
-            "Power windows",
-        ],
+    # Note: Regex extraction for features is very brittle across sites. 
+    # Valid strategy: If safety/tech words appear, add them.
+    # We use a reduced generic keyword set
+    common_features = {
+        "safety": ["Lane Departure", "Blind Spot", "Backup Camera", "Airbag", "ABS"],
+        "tech": ["Bluetooth", "Navigation", "CarPlay", "Android Auto", "USB"],
+        "interior": ["Leather", "Heated Seats", "Sunroof", "Moonroof"],
     }
-
-    for category, keywords in feature_keywords.items():
-        for keyword in keywords:
-            if keyword in raw_text:
-                if category == "safety":
-                    safety_features.append(keyword)
-                elif category == "tech":
-                    tech_features.append(keyword)
-                elif category == "interior":
-                    interior_features.append(keyword)
-                elif category == "exterior":
-                    exterior_features.append(keyword)
-                elif category == "performance":
-                    performance_features.append(keyword)
-                elif category == "standard":
-                    standard_equipment.append(keyword)
+    
+    for category, keywords in common_features.items():
+        for k in keywords:
+            if k.lower() in raw_text.lower():
+                if category == "safety": safety_features.append(k)
+                elif category == "tech": tech_features.append(k)
+                elif category == "interior": interior_features.append(k)
 
     vehicle_data = {
         "id": vehicle_id,
@@ -559,7 +437,7 @@ def extract_vehicle_data_from_raw_text(raw_text, vehicle_id, vehicle_url):
         "color": color,
         "vin": vin,
         "stockNumber": stock_number,
-        "condition": "new",
+        "condition": "new" if mileage < 1000 and mileage != 0 else "used", # Simple heuristic
         "detail_url": vehicle_url,
         "options": {
             "trim": trim,
@@ -769,17 +647,6 @@ def discover_inventory_categories(html, base_url):
         "a[class*='category']",
         "a[class*='inventory']",
         "a[class*='filter']",
-        "a[href*='honda-']",
-        "a[href*='civic']",
-        "a[href*='accord']",
-        "a[href*='cr-v']",
-        "a[href*='pilot']",
-        "a[href*='odyssey']",
-        "a[href*='passport']",
-        "a[href*='ridgeline']",
-        "a[href*='hr-v']",
-        "a[href*='insight']",
-        "a[href*='fit']",
     ]
 
     for selector in category_selectors:
@@ -793,46 +660,9 @@ def discover_inventory_categories(html, base_url):
                         keyword in full_url.lower()
                         for keyword in [
                             "inventory",
-                            "new/",
-                            "used/",
-                            "honda-",
-                            "civic",
-                            "accord",
-                            "cr-v",
-                            "pilot",
-                            "odyssey",
-                            "passport",
-                            "ridgeline",
-                            "hr-v",
-                            "insight",
-                            "fit",
+                            "new",
+                            "used",
                         ]
-                    ):
-                        if full_url not in categories and full_url != base_url:
-                            categories.append(full_url)
-        except Exception as e:
-            continue
-
-    nav_selectors = [
-        "nav a",
-        ".main-nav a",
-        ".primary-nav a",
-        ".menu a",
-        ".navigation a",
-        "ul.menu a",
-        ".header-nav a",
-    ]
-
-    for selector in nav_selectors:
-        try:
-            elements = soup.select(selector)
-            for element in elements:
-                href = element.get("href")
-                if href:
-                    full_url = urljoin(base_url, href)
-                    if any(
-                        keyword in full_url.lower()
-                        for keyword in ["inventory", "new", "used", "vehicles", "cars"]
                     ):
                         if full_url not in categories and full_url != base_url:
                             categories.append(full_url)
@@ -855,30 +685,8 @@ def discover_additional_inventory_urls(base_url):
         f"{base_url.rstrip('/')}/inventory/",
         f"{base_url.rstrip('/')}/used/",
         f"{base_url.rstrip('/')}/new/",
+        f"{base_url.rstrip('/')}/all-inventory/",
     ]
-
-    honda_models = [
-        "civic",
-        "accord",
-        "cr-v",
-        "pilot",
-        "odyssey",
-        "passport",
-        "ridgeline",
-        "hr-v",
-        "insight",
-        "fit",
-    ]
-    for model in honda_models:
-        patterns.extend(
-            [
-                f"{base_url.rstrip('/')}/new-inventory/{model}-hemet-ca.htm",
-                f"{base_url.rstrip('/')}/used-inventory/{model}-hemet-ca.htm",
-                f"{base_url.rstrip('/')}/new-honda-{model}-for-sale-in-hemet-ca.htm",
-                f"{base_url.rstrip('/')}/used-honda-{model}-for-sale-in-hemet-ca.htm",
-            ]
-        )
-
     return patterns
 
 
@@ -1057,8 +865,16 @@ def main_scraper(url, max_pages=MAX_PAGES, max_categories=MAX_CATEGORIES):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        target_url = sys.argv[1]
+        print(f"🎯 Using provided target URL: {target_url}")
+    else:
+        target_url = START_URL
+        print(f"⚠️ No URL provided in arguments. Using default: {target_url}")
+        print(f"💡 Usage: python scrapper.py <url>")
+
     main_scraper(
-        START_URL,
+        target_url,
         max_pages=MAX_PAGES,
         max_categories=MAX_CATEGORIES,
     )
