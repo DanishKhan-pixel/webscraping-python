@@ -31,8 +31,8 @@ logger = logging.getLogger(__name__)
 # You can override this via command line argument: python scrapper.py "https://yoursite.com"
 DEFAULT_START_URL = "https://www.diamondvalleyhonda.com/new-inventory/index.htm"
 START_URL = DEFAULT_START_URL
-MAX_PAGES = 50
-MAX_CATEGORIES = 20
+MAX_PAGES = 100
+MAX_CATEGORIES = 100
 CHUNK_SIZE = 800
 REQUEST_TIMEOUT = 15
 REQUEST_RETRIES = 3
