@@ -79,7 +79,6 @@ pyparsing==3.2.3
 PySocks==1.7.1
 python-dateutil==2.9.0.post0
 pytz==2025.2
-pywin32==310
 pyzmq==26.4.0
 queuelib==1.8.0
 referencing==0.36.2
@@ -113,8 +112,5 @@ websocket-client==1.8.0
 wsproto==1.2.0
 yarg==0.1.9
 zope.interface==7.2
-torch==2.4.1
-transformers==4.46.2
 webdriver-manager==4.0.2
-torch==2.4.1sentencepiece
 accelerate

@@ -2,7 +2,6 @@ import os
 import re
 import sys
 import json
-import torch
 import requests
 import logging
 from time import sleep
@@ -15,7 +14,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
 from webdriver_manager.chrome import ChromeDriverManager
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 # Configure logging
 logging.basicConfig(
@@ -41,36 +39,6 @@ REQUEST_RETRIES = 3
 REQUEST_BACKOFF = 1.5
 SELENIUM_TIMEOUT = 120
 USER_AGENT = "Mozilla/5.0"
-
-# Global variables for lazy loading
-_tokenizer = None
-_model = None
-_device = None
-
-def get_model():
-    """Lazy load the model and tokenizer only when needed."""
-    global _tokenizer, _model, _device
-    if _model is None:
-        logger.info("[Model] Loading pretrained FLAN-T5 model (Lite version)...")
-        # Switched to flan-t5-large for speed. Use 'xl' only if quality is poor.
-        model_name = "google/flan-t5-large"
-        try:
-            _tokenizer = AutoTokenizer.from_pretrained(model_name)
-            # Use device_map="auto" if accelerate is installed, otherwise manual
-            if torch.cuda.is_available():
-                _device = "cuda"
-            else:
-                _device = "cpu"
-                
-            _model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
-            _model.to(_device)
-            _model.eval()
-            
-            logger.info("[Model] Ready on %s, vocab size = %s", _device, len(_tokenizer))
-        except Exception as e:
-            logger.error(f"Failed to load model {model_name}: {e}")
-            raise
-    return _tokenizer, _model, _device
 
 
 def fetch_listing_html(url, timeout=REQUEST_TIMEOUT):
@@ -186,55 +154,7 @@ def extract_vehicle_links(html, base_url):
     return list(links)
 
 
-def clean_and_parse_json(response):
-    """Clean the raw LLM response and attempt to parse it as JSON."""
-    cleaned = response.strip()
 
-    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.MULTILINE)
-    cleaned = re.sub(r"\s*```$", "", cleaned, flags=re.MULTILINE)
-
-    json_start = cleaned.find("{")
-    json_end = cleaned.rfind("}")
-    if json_start != -1 and json_end != -1 and json_end > json_start:
-        cleaned = cleaned[json_start : json_end + 1]
-
-    if not cleaned.startswith("{"):
-        cleaned = "{ " + cleaned
-    if not cleaned.endswith("}"):
-        cleaned = cleaned + " }"
-
-    # Fix common JSON syntax errors
-    cleaned = cleaned.replace("$", "")
-    # unify quotes (dumb replacement but effective for simple cases)
-    cleaned = cleaned.replace(""", '"').replace(""", '"').replace("'", '"') 
-    
-    # Try to quote unquoted keys
-    cleaned = re.sub(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:", r'\1"\2":', cleaned)
-    
-    # Fix trailing commas
-    cleaned = re.sub(r",\s*}", "}", cleaned)
-    cleaned = re.sub(r",\s*]", "]", cleaned)
-    
-    # Fix objects stuck together
-    cleaned = re.sub(r"}\s*{", "},{", cleaned)
-
-    # Boolean/Null fixes
-    cleaned = re.sub(r":\s*true\s*([,}])", r": true\1", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r":\s*false\s*([,}])", r": false\1", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r":\s*null\s*([,}])", r": null\1", cleaned, flags=re.IGNORECASE)
-
-    try:
-        data = json.loads(cleaned)
-        return data
-    except json.JSONDecodeError:
-        # Last ditch effort: find anything that looks like JSON
-        try:
-            json_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group(0))
-        except:
-            pass
-        return None
 
 
 def get_vehicle_text_chunks_from_html(html, chunk_size=2000):
@@ -473,63 +393,7 @@ def extract_vehicle_data_from_raw_text(raw_text, vehicle_id, vehicle_url):
     return vehicle_data
 
 
-def extract_with_flan(vehicle_id, vehicle_url, text, current_data=None):
-    """
-    Use local FLAN-T5 model to dynamically extract structured vehicle data as JSON.
-    This is a fallback/enhancement method when regex fails.
-    """
-    logger.info(f"🧠 Invoking FLAN-T5 for vehicle #{vehicle_id}...")
-    tokenizer, model, device = get_model()
-
-    # Prompt
-    prompt = f"""
-    Extract vehicle specifications from the text below and return strictly valid JSON.
-    
-    Keys required: make, model, year, price, mileage, color, vin, bodyStyle, engine, transmission.
-    If unknown, use "Unknown" or 0.
-
-    Text:
-    {text[:1500]}
-    
-    JSON:
-    """
-
-    inputs = tokenizer(
-        prompt, return_tensors="pt", truncation=True, max_length=1024
-    ).to(device)
-    
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs, 
-            max_length=512, 
-            num_beams=3,
-            early_stopping=True
-        )
-    
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-    # logger.debug(f"Raw LLM response: {response}")
-
-    data = clean_and_parse_json(response)
-    
-    if data:
-        # Merge with current_data if provided
-        if current_data:
-            # We trust LLM to fill in gaps, but maybe Regex is more precise for numbers.
-            # Let's simple fill unknowns
-            for k, v in data.items():
-                if k in current_data:
-                    is_unknown = current_data[k] in [None, "Unknown", 0, "", "0"]
-                    if is_unknown and v not in [None, "Unknown", 0, ""]:
-                       current_data[k] = v
-            return current_data
-        
-        return {
-            "id": vehicle_id,
-            "detail_url": vehicle_url,
-            **data
-        }
-    
-    return current_data 
+ 
 
 
 def get_next_page_url(html, base_url):
@@ -810,20 +674,7 @@ def main_scraper(url, max_pages=MAX_PAGES, max_categories=MAX_CATEGORIES):
                     all_raw_text, total_vehicles + 1, vehicle_url
                 )
 
-                # Quality Check
-                is_low_quality = (
-                    vehicle_data["price"] == 0.0 or 
-                    vehicle_data["make"] == "Unknown" or 
-                    vehicle_data["year"] == 0
-                )
-                
-                if is_low_quality:
-                    print("  ⚠️ Low quality extraction (missing information). Enhancing with LLM...")
-                    try:
-                        vehicle_data = extract_with_flan(total_vehicles + 1, vehicle_url, all_raw_text, current_data=vehicle_data)
-                        print("  ✨ LLM enhancement successful.")
-                    except Exception as e:
-                        print(f"  ❌ LLM failed: {e}")
+
 
                 if vehicle_data:
                     # Print summary
