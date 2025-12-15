@@ -1,82 +1,58 @@
 import os
 import re
-import sys
 import json
+import torch
 import requests
-import logging
-from time import sleep
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
-from webdriver_manager.chrome import ChromeDriverManager
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("scraper.log", encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
-)
-logger = logging.getLogger(__name__)
+print("[Model] Loading pretrained FLAN-T5 model...")
+tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-xl")
+model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-xl")
 
-# Configuration
-# Configuration
-# You can override this via command line argument: python scrapper.py "https://yoursite.com"
-DEFAULT_START_URL = "https://www.diamondvalleyhonda.com/new-inventory/index.htm"
-START_URL = DEFAULT_START_URL
-MAX_PAGES = 100
-MAX_CATEGORIES = 100
-CHUNK_SIZE = 800
-REQUEST_TIMEOUT = 15
-REQUEST_RETRIES = 3
-REQUEST_BACKOFF = 1.5
-SELENIUM_TIMEOUT = 120
-USER_AGENT = "Mozilla/5.0"
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.to(device)
+model.eval()
+
+print(f"[Model] Ready on {device}, vocab size = {len(tokenizer)}")
 
 
-def fetch_listing_html(url, timeout=REQUEST_TIMEOUT):
-    """Try loading a URL via requests with basic retries/backoff."""
-    for attempt in range(1, REQUEST_RETRIES + 1):
-        try:
-            resp = requests.get(
-                url,
-                timeout=timeout,
-                headers={"User-Agent": USER_AGENT},
-            )
-            resp.raise_for_status()
-            return resp.text
-        except Exception as e:
-            logger.warning(
-                "Failed to load listing via requests (attempt %s/%s): %s",
-                attempt,
-                REQUEST_RETRIES,
-                e,
-            )
-            if attempt < REQUEST_RETRIES:
-                sleep(REQUEST_BACKOFF * attempt)
-    return None
+print("torch version       :", torch.__version__)
+print("CUDA available?     :", torch.cuda.is_available())
+print("CUDA device count   :", torch.cuda.device_count())
+if torch.cuda.is_available():
+    print("Current device name :", torch.cuda.get_device_name(0))
+    print("CUDA toolkit version:", torch.version.cuda)
 
 
-def fetch_html_with_selenium(url, timeout=SELENIUM_TIMEOUT):
+def fetch_listing_html(url, timeout=15):
+    """Try loading a URL via requests."""
+    try:
+        resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        return resp.text
+    except Exception as e:
+        print(f"Failed to load listing via requests: {e}")
+        return None
+
+
+def fetch_html_with_selenium(url, timeout=120):
     """Load URL using Selenium (headless Chrome)."""
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
     options.page_load_strategy = "eager"
 
-    logger.info("[Browser] Loading: %s", url)
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
+    print(f"[Browser] Loading: {url}")
+    driver = webdriver.Chrome(options=options)
 
     try:
         driver.set_page_load_timeout(timeout)
@@ -88,9 +64,9 @@ def fetch_html_with_selenium(url, timeout=SELENIUM_TIMEOUT):
         )
 
         html = driver.page_source
-        logger.info("[Browser] ✅ Page loaded successfully (%s chars)", len(html))
+        print(f"[Browser] ✅ Page loaded successfully ({len(html)} chars)")
     except Exception as e:
-        logger.error("❌ Failed to load %s: %s", url, e)
+        print(f"❌ Failed to load {url}: {e}")
         html = None
     finally:
         driver.quit()
@@ -115,37 +91,30 @@ def extract_vehicle_links(html, base_url):
 
         full_url = urljoin(base_url, href)
 
-        # Generic patterns for vehicle detail pages found on most dealer sites
         vehicle_patterns = [
-            r"/(?:new|used|certified|inventory)/[^/]+/[0-9]{4}-", # Common: /new/Ford/2024-...
-            r"/(?:new|used|certified|inventory)/[^/]+/id", # Common: /inventory/make/model/id/...
-            r"/(?:vehicle-details|detail)/", # Common: /vehicle-details/...
-            r"/[0-9]{4}-[a-zA-Z0-9\-]+-[0-9a-fA-F]+", # Year-Make-Model-Hash
-            r"/[0-9]{4}-[a-zA-Z0-9\-]+\.htm", # Year-Make-Model.htm
-            r"view/details/",
-            r"type=(?:new|used)",
+            r"/(new|used)/[A-Za-z\-]+/\d{4}-[A-Za-z0-9\-]+-[a-f0-9]+\.htm",
+            r"/(new|used)/[A-Za-z\-]+/\d{4}-[A-Za-z0-9\-]+\.htm",
+            r"/(new|used)/[A-Za-z\-]+/\d{4}-[A-Za-z0-9\-]+.*\.htm",
+            r"/new/[A-Za-z\-]+/\d{4}-[A-Za-z0-9\-]+.*\.htm",
+            r"/used/[A-Za-z\-]+/\d{4}-[A-Za-z0-9\-]+.*\.htm",
         ]
 
-        # Exclude common non-vehicle pages
-        exclude_patterns = [
-            r"/search", r"/compare", r"/promotion", r"/specials", r"/service", r"/parts", 
-            r"/financing", r"/about", r"/contact", r"/login", r"print", r"email"
+        general_vehicle_patterns = [
+            r".*civic.*\.htm",
+            r".*accord.*\.htm",
         ]
-
-        is_excluded = any(re.search(p, href, re.IGNORECASE) for p in exclude_patterns)
-        if is_excluded:
-            continue
 
         is_vehicle_link = False
         for pattern in vehicle_patterns:
             if re.search(pattern, href, re.IGNORECASE):
                 is_vehicle_link = True
                 break
-        
-        # Heuristic: URL contains Year and specific keywords usually implies a car listing
+
         if not is_vehicle_link:
-            if re.search(r"20[0-2][0-9]", href) and any(x in href.lower() for x in ["new", "used", "inventory", "detail"]):
-                is_vehicle_link = True
+            for pattern in general_vehicle_patterns:
+                if re.search(pattern, href, re.IGNORECASE):
+                    is_vehicle_link = True
+                    break
 
         if is_vehicle_link:
             links.add(full_url)
@@ -154,7 +123,83 @@ def extract_vehicle_links(html, base_url):
     return list(links)
 
 
+def query_flant5(prompt):
+    """
+    Sends a prompt to FLAN-T5 and safely converts the response into valid JSON.
+    """
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
+    outputs = model.generate(
+        inputs["input_ids"], max_length=1024, num_beams=5, early_stopping=True
+    )
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+    print(f"Raw response from FLAN-T5: {response}")
 
+    cleaned = response.strip()
+
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"\s*```$", "", cleaned, flags=re.MULTILINE)
+
+    json_start = cleaned.find("{")
+    json_end = cleaned.rfind("}")
+    if json_start != -1 and json_end != -1 and json_end > json_start:
+        cleaned = cleaned[json_start : json_end + 1]
+
+    if not cleaned.startswith("{"):
+        cleaned = "{ " + cleaned
+    if not cleaned.endswith("}"):
+        cleaned = cleaned + " }"
+
+    cleaned = cleaned.replace("$", "")
+    cleaned = cleaned.replace(""", '"').replace(""", '"').replace("'", "'")
+    cleaned = cleaned.replace("'", "'").replace(""", '"').replace(""", '"')
+
+    cleaned = re.sub(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:", r'\1"\2":', cleaned)
+    cleaned = re.sub(r":\s*([A-Za-z_][A-Za-z0-9_]*)\s*([,}])", r': "\1"\2', cleaned)
+    cleaned = re.sub(r",\s*}", "}", cleaned)
+    cleaned = re.sub(r",\s*]", "]", cleaned)
+    cleaned = re.sub(r"}\s*{", "},{", cleaned)
+
+    cleaned = re.sub(r":\s*true\s*([,}])", r": true\1", cleaned)
+    cleaned = re.sub(r":\s*false\s*([,}])", r": false\1", cleaned)
+    cleaned = re.sub(r":\s*null\s*([,}])", r": null\1", cleaned)
+
+    if '"options":' in cleaned and not re.search(r'"options":\s*\{[^}]*\}', cleaned):
+        options_match = re.search(r'"options":\s*([^}]+?)(?=,|$)', cleaned)
+        if options_match:
+            options_content = options_match.group(1).strip()
+            if not options_content.startswith("{"):
+                cleaned = re.sub(
+                    r'"options":\s*[^}]+?(?=,|$)', '"options": {}', cleaned
+                )
+            else:
+                cleaned = cleaned.replace(options_content, options_content + "}")
+
+    if '"options":' not in cleaned or re.search(r'"options":\s*\{\s*\}', cleaned):
+        cleaned = re.sub(
+            r'"options":\s*\{\s*\}',
+            '"options": {"trim": "Unknown", "bodyStyle": "Unknown", "doors": "Unknown", "engine": "Unknown", "transmission": "Unknown", "drivetrain": "Unknown", "mpgCity": "Unknown", "mpgHighway": "Unknown", "seatingCapacity": "Unknown", "safetyFeatures": [], "techFeatures": [], "interiorFeatures": [], "exteriorFeatures": [], "performanceFeatures": [], "standardEquipment": [], "optionalEquipment": []}',
+            cleaned,
+        )
+
+    try:
+        vehicle_data = json.loads(cleaned)
+        print("✅ JSON parsed successfully!")
+        return vehicle_data
+    except json.JSONDecodeError as e:
+        print(f"[Error] JSON decode failed: {e}")
+        print(f"Cleaned response was:\n{cleaned}")
+
+        try:
+            json_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+            if json_match:
+                alt_cleaned = json_match.group(0)
+                vehicle_data = json.loads(alt_cleaned)
+                print("✅ JSON parsed successfully with alternative method!")
+                return vehicle_data
+        except:
+            pass
+
+        return {"error": "Failed to parse response", "raw_response": response}
 
 
 def get_vehicle_text_chunks_from_html(html, chunk_size=2000):
@@ -204,8 +249,10 @@ def get_vehicle_text_chunks_from_html(html, chunk_size=2000):
 def extract_vehicle_data_from_raw_text(raw_text, vehicle_id, vehicle_url):
     """
     This function receives raw vehicle listing text and processes it to extract the relevant fields.
-    It returns the structured data in the required JSON format using generic regex extraction.
+    It returns the structured data in the required JSON format using direct regex extraction.
     """
+    print(f"🔍 Extracting vehicle data using direct pattern matching...")
+
     make = "Unknown"
     model = "Unknown"
     year = 0
@@ -244,108 +291,241 @@ def extract_vehicle_data_from_raw_text(raw_text, vehicle_id, vehicle_url):
     standard_equipment = []
     optional_equipment = []
 
-    # Generic Make/Model detection looking for labels
-    # e.g. "Make: Toyota", "Model: Camry"
-    make_match = re.search(r"(?:Make|Manufacturer):\s*([A-Za-z0-9\-]+)", raw_text, re.IGNORECASE)
-    if make_match:
-        make = make_match.group(1).strip()
-    
-    model_match = re.search(r"Model:\s*([A-Za-z0-9\-\s]+?)(?:\n|$)", raw_text, re.IGNORECASE)
-    if model_match:
-        model = model_match.group(1).strip()
-    
-    # Try textual patterns (e.g. "2024 Honda Civic")
-    # This acts as a backup if explicit labels aren't found
-    if make == "Unknown" or model == "Unknown":
-        header_match = re.search(r"(20[0-2][0-9])\s+([A-Z][a-z]+)\s+([A-Z0-9][a-zA-Z0-9\-\s]+)", raw_text)
-        if header_match:
-            if year == 0: year = int(header_match.group(1))
-            if make == "Unknown": make = header_match.group(2)
-            # Rough guess for model, might include trim
-            if model == "Unknown": model = header_match.group(3).split("\n")[0].strip()
+    if "Honda" in raw_text:
+        make = "Honda"
 
-    year_match = re.search(r"20(2[0-9])|20(1[0-9])|20(0[0-9])", raw_text)
-    if year_match and year == 0:
-        # Construct the full year from the groups
-        y_str = year_match.group(0)
-        year = int(y_str)
-
-    # Price: look for larger numbers with $ sign, picking the first reasonable one
-    price_matches = re.finditer(r"\$([0-9]{1,3}(?:,[0-9]{3})*)", raw_text)
-    for pm in price_matches:
-        p_val = float(pm.group(1).replace(",", ""))
-        if p_val > 1000: # filter out small prices like accessories
-            price = p_val
+    model_patterns = [
+        "Civic",
+        "Accord",
+        "CR-V",
+        "Pilot",
+        "HR-V",
+        "Passport",
+        "Ridgeline",
+        "Odyssey",
+        "Insight",
+    ]
+    for pattern in model_patterns:
+        if pattern in raw_text:
+            model = pattern
             break
 
-    # Mileage
-    mileage_match = re.search(r"(?:Mileage|Odometer):\s*([0-9,]+)", raw_text, re.IGNORECASE)
-    if mileage_match:
-        mileage = int(mileage_match.group(1).replace(",", ""))
-    else:
-        # Look for "XX,XXX miles" patterns
-        m_match = re.search(r"([0-9,]{1,7})\+?\s*(?:miles|mi\.)", raw_text, re.IGNORECASE)
-        if m_match:
-            try:
-                mileage = int(m_match.group(1).replace(",", ""))
-            except:
-                pass
+    year_match = re.search(r"20(2[0-9])", raw_text)
+    if year_match:
+        year = int("20" + year_match.group(1))
 
-    # Color
-    color_match = re.search(r"(?:Exterior Color|Color):\s*([A-Za-z\s]+)", raw_text, re.IGNORECASE)
-    if color_match:
-        color = color_match.group(1).strip()
+    price_match = re.search(r"\$([0-9,]+)", raw_text)
+    if price_match:
+        price = float(price_match.group(1).replace(",", ""))
 
-    # VIN
+    color_patterns = [
+        "Solar Silver",
+        "Crystal Black Pearl",
+        "Rallye Red",
+        "Platinum White Pearl",
+        "Black",
+        "White",
+        "Silver",
+        "Blue",
+        "Red",
+        "Gray",
+        "Grey",
+    ]
+    for color_pattern in color_patterns:
+        if color_pattern in raw_text:
+            color = color_pattern
+            break
+
+    interior_color = "Unknown"
+    if "Interior Color" in raw_text:
+        interior_match = re.search(r"Interior Color\s*\n\s*([^\n]+)", raw_text)
+        if interior_match:
+            interior_color = interior_match.group(1).strip()
+
     vin_match = re.search(r"[A-HJ-NPR-Z0-9]{17}", raw_text)
     if vin_match:
         vin = vin_match.group(0)
 
-    # Stock Number
-    stock_match = re.search(r"(?:Stock Number|Stock #|Stock No\.?):\s*([A-Z0-9\-]+)", raw_text, re.IGNORECASE)
+    stock_match = re.search(r"Stock Number\s*([A-Z0-9]+)", raw_text)
     if stock_match:
-        stock_number = stock_match.group(1).strip()
+        stock_number = stock_match.group(1)
 
-    # Trim
-    trim_match = re.search(r"Trim:\s*([A-Za-z0-9\-\s]+)", raw_text, re.IGNORECASE)
-    if trim_match:
-        trim = trim_match.group(1).strip()
+    trim_patterns = ["LX", "EX", "Sport", "Touring", "Type R", "Si"]
+    for pattern in trim_patterns:
+        if pattern in raw_text:
+            trim = pattern
+            break
 
-    # Body Style
-    body_match = re.search(r"(?:Body Style|Body):\s*([A-Za-z\s]+)", raw_text, re.IGNORECASE)
-    if body_match:
-        body_style = body_match.group(1).strip()
+    body_style_patterns = ["Sedan", "SUV", "Hatchback", "Coupe", "Convertible", "Wagon"]
+    for pattern in body_style_patterns:
+        if pattern in raw_text:
+            body_style = pattern
+            break
 
-    # Transmission
-    trans_match = re.search(r"(?:Transmission|Trans):\s*([A-Za-z0-9\-\s\.]+)", raw_text, re.IGNORECASE)
-    if trans_match:
-        transmission = trans_match.group(1).strip()
+    doors_match = re.search(r"(\d+)\s*doors?", raw_text)
+    if doors_match:
+        doors = doors_match.group(1)
+    elif "Sedan" in raw_text:
+        doors = "4"
+    elif "SUV" in raw_text or "Hatchback" in raw_text:
+        doors = "5"
 
-    # Engine
-    eng_match = re.search(r"Engine:\s*([A-Za-z0-9\-\s\.]+)", raw_text, re.IGNORECASE)
-    if eng_match:
-        engine = eng_match.group(1).strip()
+    engine_patterns = ["I-4 cyl", "V6", "V8", "2.0L", "1.5L", "3.5L", "Turbo"]
+    for pattern in engine_patterns:
+        if pattern in raw_text:
+            engine = pattern
+            break
 
-    # Drivetrain
-    drive_match = re.search(r"(?:Drivetrain|Drive Type):\s*([A-Za-z0-9\-\s]+)", raw_text, re.IGNORECASE)
-    if drive_match:
-        drivetrain = drive_match.group(1).strip()
+    engine_size_match = re.search(r"Engine liters:\s*([0-9.]+L)", raw_text)
+    if engine_size_match:
+        engine_size = engine_size_match.group(1)
 
-    # Note: Regex extraction for features is very brittle across sites. 
-    # Valid strategy: If safety/tech words appear, add them.
-    # We use a reduced generic keyword set
-    common_features = {
-        "safety": ["Lane Departure", "Blind Spot", "Backup Camera", "Airbag", "ABS"],
-        "tech": ["Bluetooth", "Navigation", "CarPlay", "Android Auto", "USB"],
-        "interior": ["Leather", "Heated Seats", "Sunroof", "Moonroof"],
+    hp_match = re.search(r"Horsepower:\s*([0-9]+)hp", raw_text)
+    if hp_match:
+        horsepower = hp_match.group(1) + "hp"
+
+    torque_match = re.search(r"Torque:\s*([0-9]+)\s*lb\.-ft\.", raw_text)
+    if torque_match:
+        torque = torque_match.group(1) + " lb.-ft."
+
+    transmission_patterns = [
+        "CVT",
+        "Automatic",
+        "Manual",
+        "6-speed",
+        "8-speed",
+        "9-speed",
+    ]
+    for pattern in transmission_patterns:
+        if pattern in raw_text:
+            transmission = pattern
+            break
+
+    drivetrain_patterns = [
+        "Front-Wheel Drive",
+        "All-Wheel Drive",
+        "Rear-Wheel Drive",
+        "4WD",
+        "AWD",
+        "FWD",
+        "RWD",
+    ]
+    for pattern in drivetrain_patterns:
+        if pattern in raw_text:
+            drivetrain = pattern
+            break
+
+    mpg_match = re.search(r"(\d+)/(\d+)\s*MPG", raw_text)
+    if mpg_match:
+        mpg_city = mpg_match.group(1)
+        mpg_highway = mpg_match.group(2)
+
+    seating_match = re.search(r"(\d+)\s*seats?", raw_text)
+    if seating_match:
+        seating_capacity = seating_match.group(1)
+
+    if "Gasoline" in raw_text or "Gas" in raw_text:
+        fuel_type = "Gasoline"
+    elif "Hybrid" in raw_text:
+        fuel_type = "Hybrid"
+    elif "Electric" in raw_text or "EV" in raw_text:
+        fuel_type = "Electric"
+
+    fuel_cap_match = re.search(r"Fuel tank capacity:\s*([0-9.]+)gal\.", raw_text)
+    if fuel_cap_match:
+        fuel_capacity = fuel_cap_match.group(1) + " gal."
+
+    length_match = re.search(
+        r'Exterior length:\s*([0-9,]+)mm\s*\(([0-9.]+)"\)', raw_text
+    )
+    if length_match:
+        length = length_match.group(2) + '"'
+
+    width_match = re.search(
+        r'Exterior body width:\s*([0-9,]+)mm\s*\(([0-9.]+)"\)', raw_text
+    )
+    if width_match:
+        width = width_match.group(2) + '"'
+
+    height_match = re.search(
+        r'Exterior height:\s*([0-9,]+)mm\s*\(([0-9.]+)"\)', raw_text
+    )
+    if height_match:
+        height = height_match.group(2) + '"'
+
+    wheelbase_match = re.search(r'Wheelbase:\s*([0-9,]+)mm\s*\(([0-9.]+)"\)', raw_text)
+    if wheelbase_match:
+        wheelbase = wheelbase_match.group(2) + '"'
+
+    weight_match = re.search(r"Curb weight:\s*([0-9,]+)kg\s*\(([0-9,]+)lbs\)", raw_text)
+    if weight_match:
+        curb_weight = weight_match.group(2) + " lbs"
+
+    cargo_match = re.search(
+        r"Interior.*cargo volume:\s*([0-9]+)\s*L\s*\(([0-9.]+)\s*cu\.ft\.\)", raw_text
+    )
+    if cargo_match:
+        cargo_capacity = cargo_match.group(2) + " cu.ft."
+
+    feature_keywords = {
+        "safety": [
+            "Lane departure",
+            "ABS",
+            "Traction control",
+            "Airbags",
+            "Blind spot",
+            "Collision",
+            "Safety",
+        ],
+        "tech": [
+            "Wireless phone connectivity",
+            "Exterior parking camera",
+            "Navigation",
+            "Bluetooth",
+            "USB",
+            "Touchscreen",
+        ],
+        "interior": [
+            "Automatic temperature control",
+            "Steering wheel mounted audio controls",
+            "Leather",
+            "Heated seats",
+        ],
+        "exterior": [
+            "Auto high-beam headlights",
+            "Fully automatic headlights",
+            "LED",
+            "Fog lights",
+        ],
+        "performance": [
+            "Speed-sensing steering",
+            "Four wheel independent suspension",
+            "Sport mode",
+        ],
+        "standard": [
+            "4 Speakers",
+            "AM/FM radio",
+            "Air Conditioning",
+            "Power steering",
+            "Power windows",
+        ],
     }
-    
-    for category, keywords in common_features.items():
-        for k in keywords:
-            if k.lower() in raw_text.lower():
-                if category == "safety": safety_features.append(k)
-                elif category == "tech": tech_features.append(k)
-                elif category == "interior": interior_features.append(k)
+
+    for category, keywords in feature_keywords.items():
+        for keyword in keywords:
+            if keyword in raw_text:
+                if category == "safety":
+                    safety_features.append(keyword)
+                elif category == "tech":
+                    tech_features.append(keyword)
+                elif category == "interior":
+                    interior_features.append(keyword)
+                elif category == "exterior":
+                    exterior_features.append(keyword)
+                elif category == "performance":
+                    performance_features.append(keyword)
+                elif category == "standard":
+                    standard_equipment.append(keyword)
 
     vehicle_data = {
         "id": vehicle_id,
@@ -357,7 +537,7 @@ def extract_vehicle_data_from_raw_text(raw_text, vehicle_id, vehicle_url):
         "color": color,
         "vin": vin,
         "stockNumber": stock_number,
-        "condition": "new" if mileage < 1000 and mileage != 0 else "used", # Simple heuristic
+        "condition": "new",
         "detail_url": vehicle_url,
         "options": {
             "trim": trim,
@@ -390,10 +570,107 @@ def extract_vehicle_data_from_raw_text(raw_text, vehicle_id, vehicle_url):
             "optionalEquipment": optional_equipment,
         },
     }
+
+    print(f"✅ Vehicle #{vehicle_id}: Direct extraction completed")
     return vehicle_data
 
 
- 
+def extract_with_flan(vehicle_id, vehicle_url, text):
+    """
+    Use local FLAN-T5 model to dynamically extract structured vehicle data as JSON.
+    Works without API keys.
+    """
+    prompt = f"""
+    Extract vehicle information and return ONLY a valid JSON object. No explanations, no markdown, no extra text.
+
+    JSON format:
+    {{
+    "id": {vehicle_id},
+    "make": "Unknown",
+    "model": "Unknown",
+    "year": 0,
+    "price": 0.0,
+    "mileage": 0,
+    "color": "Unknown",
+    "vin": "",
+    "stockNumber": "",
+    "condition": "new",
+    "detail_url": "{vehicle_url}",
+    "options": {{
+        "trim": "Unknown",
+        "bodyStyle": "",
+        "doors": "Unknown",
+        "engine": "Unknown",
+        "engineSize": "Unknown",
+        "horsepower": "Unknown",
+        "torque": "Unknown",
+        "transmission": "Unknown",
+        "drivetrain": "Unknown",
+        "fuelType": "Unknown",
+        "fuelCapacity": "Unknown",
+        "mpgCity": "Unknown",
+        "mpgHighway": "Unknown",
+        "seatingCapacity": "Unknown",
+        "cargoCapacity": "Unknown",
+        "wheelbase": "Unknown",
+        "length": "Unknown",
+        "width": "Unknown",
+        "height": "Unknown",
+        "curbWeight": "Unknown",
+        "groundClearance": "Unknown",
+        "safetyFeatures": [],
+        "techFeatures": [],
+        "interiorFeatures": [],
+        "exteriorFeatures": [],
+        "performanceFeatures": [],
+        "standardEquipment": [],
+        "optionalEquipment": []
+    }}
+    }}
+
+    Rules: Use double quotes, use "Unknown" for missing strings, 0 for missing numbers, empty arrays for missing lists, return only JSON.
+
+    Vehicle listing text:
+    {text}
+    """
+
+    inputs = tokenizer(
+        prompt, return_tensors="pt", truncation=True, max_length=1024
+    ).to(device)
+    outputs = model.generate(
+        **inputs, max_length=1024, num_beams=2, early_stopping=True
+    )
+    decoded = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+
+    try:
+        data = query_flant5(prompt)
+        if "error" not in data:
+            print(f"✅ Vehicle #{vehicle_id}: structured JSON parsed successfully")
+            return data
+        else:
+            raise Exception("JSON parsing failed")
+    except Exception:
+        print(f"⚠️ Vehicle #{vehicle_id}: Could not parse JSON, saving fallback text.")
+        print("Raw vehicle data:", text[:500])
+        return {"id": vehicle_id, "detail_url": vehicle_url, "raw_text": text[:500]}
+
+
+def merge_vehicle_data(results):
+    """Merge partial vehicle data chunks safely."""
+    if not results:
+        return None
+
+    valid = [r for r in results if isinstance(r, dict)]
+    if not valid:
+        return None
+
+    merged = valid[0].copy()
+
+    for data in valid[1:]:
+        for key, val2 in data.items():
+            if key not in merged or not merged[key]:
+                merged[key] = val2
+    return merged
 
 
 def get_next_page_url(html, base_url):
@@ -511,6 +788,17 @@ def discover_inventory_categories(html, base_url):
         "a[class*='category']",
         "a[class*='inventory']",
         "a[class*='filter']",
+        "a[href*='honda-']",
+        "a[href*='civic']",
+        "a[href*='accord']",
+        "a[href*='cr-v']",
+        "a[href*='pilot']",
+        "a[href*='odyssey']",
+        "a[href*='passport']",
+        "a[href*='ridgeline']",
+        "a[href*='hr-v']",
+        "a[href*='insight']",
+        "a[href*='fit']",
     ]
 
     for selector in category_selectors:
@@ -524,9 +812,46 @@ def discover_inventory_categories(html, base_url):
                         keyword in full_url.lower()
                         for keyword in [
                             "inventory",
-                            "new",
-                            "used",
+                            "new/",
+                            "used/",
+                            "honda-",
+                            "civic",
+                            "accord",
+                            "cr-v",
+                            "pilot",
+                            "odyssey",
+                            "passport",
+                            "ridgeline",
+                            "hr-v",
+                            "insight",
+                            "fit",
                         ]
+                    ):
+                        if full_url not in categories and full_url != base_url:
+                            categories.append(full_url)
+        except Exception as e:
+            continue
+
+    nav_selectors = [
+        "nav a",
+        ".main-nav a",
+        ".primary-nav a",
+        ".menu a",
+        ".navigation a",
+        "ul.menu a",
+        ".header-nav a",
+    ]
+
+    for selector in nav_selectors:
+        try:
+            elements = soup.select(selector)
+            for element in elements:
+                href = element.get("href")
+                if href:
+                    full_url = urljoin(base_url, href)
+                    if any(
+                        keyword in full_url.lower()
+                        for keyword in ["inventory", "new", "used", "vehicles", "cars"]
                     ):
                         if full_url not in categories and full_url != base_url:
                             categories.append(full_url)
@@ -549,14 +874,41 @@ def discover_additional_inventory_urls(base_url):
         f"{base_url.rstrip('/')}/inventory/",
         f"{base_url.rstrip('/')}/used/",
         f"{base_url.rstrip('/')}/new/",
-        f"{base_url.rstrip('/')}/all-inventory/",
     ]
+
+    honda_models = [
+        "civic",
+        "accord",
+        "cr-v",
+        "pilot",
+        "odyssey",
+        "passport",
+        "ridgeline",
+        "hr-v",
+        "insight",
+        "fit",
+    ]
+    for model in honda_models:
+        patterns.extend(
+            [
+                f"{base_url.rstrip('/')}/new-inventory/{model}-hemet-ca.htm",
+                f"{base_url.rstrip('/')}/used-inventory/{model}-hemet-ca.htm",
+                f"{base_url.rstrip('/')}/new-honda-{model}-for-sale-in-hemet-ca.htm",
+                f"{base_url.rstrip('/')}/used-honda-{model}-for-sale-in-hemet-ca.htm",
+            ]
+        )
+
     return patterns
 
 
-def main_scraper(url, max_pages=MAX_PAGES, max_categories=MAX_CATEGORIES):
+def main_scraper(url, max_pages=50, max_categories=20):
     """
     Enhanced main scraper with comprehensive pagination and category discovery
+
+    Args:
+        url: Starting URL for the inventory page
+        max_pages: Maximum number of pages to scrape per category (safety limit)
+        max_categories: Maximum number of categories to process (safety limit)
     """
     output_file = "vehicle_inventory.json"
     with open(output_file, "w", encoding="utf-8") as f:
@@ -590,11 +942,10 @@ def main_scraper(url, max_pages=MAX_PAGES, max_categories=MAX_CATEGORIES):
 
         total_discovered = len(discovered_categories) + len(additional_patterns)
         print(f"📊 Total categories to process: {total_discovered}")
-        # Only print first few
-        for i, cat in enumerate(categories_to_process[:5], 1):
+        for i, cat in enumerate(categories_to_process[:15], 1):
             print(f"  {i}. {cat}")
-        if len(categories_to_process) > 5:
-            print(f"  ... and {len(categories_to_process) - 5} more")
+        if len(categories_to_process) > 15:
+            print(f"  ... and {len(categories_to_process) - 15} more")
 
     category_count = 0
     for category_url in categories_to_process:
@@ -609,7 +960,7 @@ def main_scraper(url, max_pages=MAX_PAGES, max_categories=MAX_CATEGORIES):
         processed_categories.add(category_url)
 
         print(f"\n{'='*60}")
-        print(f"📂 PROCESSING CATEGORY {category_count}")
+        print(f"📂 PROCESSING CATEGORY {category_count}/{len(categories_to_process)}")
         print(f"🌐 Category URL: {category_url}")
         print(f"{'='*60}")
 
@@ -618,7 +969,7 @@ def main_scraper(url, max_pages=MAX_PAGES, max_categories=MAX_CATEGORIES):
         category_vehicles = 0
 
         while current_page_url and page_number <= max_pages:
-            print(f"\n📄 Processing page {page_number}...")
+            print(f"\n📄 Processing page {page_number} of category {category_count}...")
             print(f"🔗 URL: {current_page_url}")
 
             if current_page_url in processed_urls:
@@ -632,9 +983,9 @@ def main_scraper(url, max_pages=MAX_PAGES, max_categories=MAX_CATEGORIES):
                 print(f"❌ Failed to load page: {current_page_url}")
                 break
 
-            # print(f"🔍 Extracting vehicle links...")
+            print(f"🔍 Extracting vehicle links...")
             vehicle_links = extract_vehicle_links(inventory_html, current_page_url)
-            # print(f"🔗 Found {len(vehicle_links)} vehicle detail links")
+            print(f"🔗 Found {len(vehicle_links)} vehicle detail links")
 
             if not vehicle_links:
                 print(f"⚠️ No vehicle links found, moving to next page")
@@ -661,25 +1012,24 @@ def main_scraper(url, max_pages=MAX_PAGES, max_categories=MAX_CATEGORIES):
                     continue
 
                 html_chunks = get_vehicle_text_chunks_from_html(
-                    page_html, chunk_size=CHUNK_SIZE
+                    page_html, chunk_size=800
                 )
-                
-                # Use only first 2 chunks for efficiency (listing is usually top)
+                print(f"  → got {len(html_chunks)} chunks")
+
                 all_raw_text = ""
-                for chunk in html_chunks[:3]:
+                for chunk_num, chunk in enumerate(html_chunks, start=1):
+                    print(f"  Accumulating chunk {chunk_num}/{len(html_chunks)}...")
                     all_raw_text += chunk + "\n"
 
-                # print(f"  > Extracting structured data (Regex)...")
+                print(f"\n🚗 Extracting structured data...")
                 vehicle_data = extract_vehicle_data_from_raw_text(
                     all_raw_text, total_vehicles + 1, vehicle_url
                 )
 
-
-
                 if vehicle_data:
-                    # Print summary
-                    print(f"  ✔ Results: {vehicle_data.get('year')} {vehicle_data.get('make')} {vehicle_data.get('model')} - ${vehicle_data.get('price')}")
-                    
+                    print("VEHICLE SCRAPED")
+                    print(json.dumps(vehicle_data, indent=2, ensure_ascii=False))
+
                     with open(output_file, "a", encoding="utf-8") as f:
                         if not first:
                             f.write(",\n")
@@ -687,12 +1037,13 @@ def main_scraper(url, max_pages=MAX_PAGES, max_categories=MAX_CATEGORIES):
                         first = False
                     total_vehicles += 1
                     category_vehicles += 1
+                    print(f"  ✔ Saved vehicle #{total_vehicles}")
 
             print(f"\n🔍 Looking for next page in category...")
             next_page_url = get_next_page_url(inventory_html, current_page_url)
 
             if next_page_url:
-                # print(f"✅ Found next page: {next_page_url}")
+                print(f"✅ Found next page: {next_page_url}")
                 current_page_url = next_page_url
                 page_number += 1
             else:
@@ -716,16 +1067,8 @@ def main_scraper(url, max_pages=MAX_PAGES, max_categories=MAX_CATEGORIES):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        target_url = sys.argv[1]
-        print(f"🎯 Using provided target URL: {target_url}")
-    else:
-        target_url = START_URL
-        print(f"⚠️ No URL provided in arguments. Using default: {target_url}")
-        print(f"💡 Usage: python scrapper.py <url>")
-
     main_scraper(
-        target_url,
-        max_pages=MAX_PAGES,
-        max_categories=MAX_CATEGORIES,
+        "https://www.diamondvalleyhonda.com/new-inventory/index.htm",
+        max_pages=50,
+        max_categories=20,
     )
