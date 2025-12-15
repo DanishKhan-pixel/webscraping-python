@@ -1,8 +1,9 @@
 import os
 import re
 import json
-import torch
 import requests
+import logging
+from datetime import datetime
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from selenium import webdriver
@@ -10,48 +11,91 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
+import time
 
-print("[Model] Loading pretrained FLAN-T5 model...")
-tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-xl")
-model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-xl")
+# ============================================================================
+# LOGGING CONFIGURATION
+# ============================================================================
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model.to(device)
-model.eval()
+# Create logs directory if it doesn't exist
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
 
-print(f"[Model] Ready on {device}, vocab size = {len(tokenizer)}")
+# Generate log filename with timestamp
+log_filename = os.path.join(LOG_DIR, f"scraper_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_filename, encoding='utf-8'),
+        logging.StreamHandler()  # Also output to console
+    ]
+)
+
+# Create logger
+logger = logging.getLogger(__name__)
+
+# Log startup
+logger.info("="*60)
+logger.info("Web Scraper Started (Optimized Version)")
+logger.info(f"Log file: {log_filename}")
+logger.info("="*60)
+
+# ============================================================================
+# REMOVED: FLAN-T5 model loading (was never used in the main flow)
+# The model was loaded at startup but extract_with_flan() was never called
+# This saves 30-60+ seconds of startup time and significant memory
+# ============================================================================
+
+# Configuration
+MAX_WORKERS = 3  # Number of concurrent browser instances
+SELENIUM_TIMEOUT = 120
+REQUEST_TIMEOUT = 15
+
+logger.info(f"Configuration: MAX_WORKERS={MAX_WORKERS}, SELENIUM_TIMEOUT={SELENIUM_TIMEOUT}s, REQUEST_TIMEOUT={REQUEST_TIMEOUT}s")
 
 
-print("torch version       :", torch.__version__)
-print("CUDA available?     :", torch.cuda.is_available())
-print("CUDA device count   :", torch.cuda.device_count())
-if torch.cuda.is_available():
-    print("Current device name :", torch.cuda.get_device_name(0))
-    print("CUDA toolkit version:", torch.version.cuda)
-
-
-def fetch_listing_html(url, timeout=15):
+def fetch_listing_html(url, timeout=REQUEST_TIMEOUT):
     """Try loading a URL via requests."""
     try:
         resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
         return resp.text
     except Exception as e:
-        print(f"Failed to load listing via requests: {e}")
+        logger.warning(f"Failed to load listing via requests: {e}")
         return None
 
 
-def fetch_html_with_selenium(url, timeout=120):
-    """Load URL using Selenium (headless Chrome)."""
+def get_chrome_options():
+    """Get optimized Chrome options for faster loading."""
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--window-size=1920,1080")
-    options.page_load_strategy = "eager"
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.page_load_strategy = "eager"  # Don't wait for all resources
+    
+    # Performance optimizations
+    prefs = {
+        "profile.managed_default_content_settings.images": 2,  # Disable images
+        "profile.default_content_setting_values.notifications": 2,
+    }
+    options.add_experimental_option("prefs", prefs)
+    
+    return options
 
-    print(f"[Browser] Loading: {url}")
+
+def fetch_html_with_selenium(url, timeout=SELENIUM_TIMEOUT):
+    """Load URL using Selenium (headless Chrome) with optimizations."""
+    options = get_chrome_options()
+    
+    logger.info(f"[Browser] Loading: {url}")
     driver = webdriver.Chrome(options=options)
 
     try:
@@ -64,9 +108,9 @@ def fetch_html_with_selenium(url, timeout=120):
         )
 
         html = driver.page_source
-        print(f"[Browser] ✅ Page loaded successfully ({len(html)} chars)")
+        logger.info(f"[Browser] ✅ Page loaded successfully ({len(html)} chars)")
     except Exception as e:
-        print(f"❌ Failed to load {url}: {e}")
+        logger.error(f"❌ Failed to load {url}: {e}")
         html = None
     finally:
         driver.quit()
@@ -79,7 +123,7 @@ def extract_vehicle_links(html, base_url):
     Extracts only actual vehicle detail links from the page.
     Filters out generic pages like /inventory/index.htm or /specials/.
     """
-    print(f"[Link Extraction] Extracting vehicle detail links...")
+    logger.info(f"[Link Extraction] Extracting vehicle detail links...")
     soup = BeautifulSoup(html, "html.parser")
     links = set()
 
@@ -119,91 +163,13 @@ def extract_vehicle_links(html, base_url):
         if is_vehicle_link:
             links.add(full_url)
 
-    print(f"[Link Extraction] Found {len(links)} vehicle detail links.")
+    logger.info(f"[Link Extraction] Found {len(links)} vehicle detail links.")
     return list(links)
 
 
-def query_flant5(prompt):
-    """
-    Sends a prompt to FLAN-T5 and safely converts the response into valid JSON.
-    """
-    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
-    outputs = model.generate(
-        inputs["input_ids"], max_length=1024, num_beams=5, early_stopping=True
-    )
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-    print(f"Raw response from FLAN-T5: {response}")
-
-    cleaned = response.strip()
-
-    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.MULTILINE)
-    cleaned = re.sub(r"\s*```$", "", cleaned, flags=re.MULTILINE)
-
-    json_start = cleaned.find("{")
-    json_end = cleaned.rfind("}")
-    if json_start != -1 and json_end != -1 and json_end > json_start:
-        cleaned = cleaned[json_start : json_end + 1]
-
-    if not cleaned.startswith("{"):
-        cleaned = "{ " + cleaned
-    if not cleaned.endswith("}"):
-        cleaned = cleaned + " }"
-
-    cleaned = cleaned.replace("$", "")
-    cleaned = cleaned.replace(""", '"').replace(""", '"').replace("'", "'")
-    cleaned = cleaned.replace("'", "'").replace(""", '"').replace(""", '"')
-
-    cleaned = re.sub(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:", r'\1"\2":', cleaned)
-    cleaned = re.sub(r":\s*([A-Za-z_][A-Za-z0-9_]*)\s*([,}])", r': "\1"\2', cleaned)
-    cleaned = re.sub(r",\s*}", "}", cleaned)
-    cleaned = re.sub(r",\s*]", "]", cleaned)
-    cleaned = re.sub(r"}\s*{", "},{", cleaned)
-
-    cleaned = re.sub(r":\s*true\s*([,}])", r": true\1", cleaned)
-    cleaned = re.sub(r":\s*false\s*([,}])", r": false\1", cleaned)
-    cleaned = re.sub(r":\s*null\s*([,}])", r": null\1", cleaned)
-
-    if '"options":' in cleaned and not re.search(r'"options":\s*\{[^}]*\}', cleaned):
-        options_match = re.search(r'"options":\s*([^}]+?)(?=,|$)', cleaned)
-        if options_match:
-            options_content = options_match.group(1).strip()
-            if not options_content.startswith("{"):
-                cleaned = re.sub(
-                    r'"options":\s*[^}]+?(?=,|$)', '"options": {}', cleaned
-                )
-            else:
-                cleaned = cleaned.replace(options_content, options_content + "}")
-
-    if '"options":' not in cleaned or re.search(r'"options":\s*\{\s*\}', cleaned):
-        cleaned = re.sub(
-            r'"options":\s*\{\s*\}',
-            '"options": {"trim": "Unknown", "bodyStyle": "Unknown", "doors": "Unknown", "engine": "Unknown", "transmission": "Unknown", "drivetrain": "Unknown", "mpgCity": "Unknown", "mpgHighway": "Unknown", "seatingCapacity": "Unknown", "safetyFeatures": [], "techFeatures": [], "interiorFeatures": [], "exteriorFeatures": [], "performanceFeatures": [], "standardEquipment": [], "optionalEquipment": []}',
-            cleaned,
-        )
-
-    try:
-        vehicle_data = json.loads(cleaned)
-        print("✅ JSON parsed successfully!")
-        return vehicle_data
-    except json.JSONDecodeError as e:
-        print(f"[Error] JSON decode failed: {e}")
-        print(f"Cleaned response was:\n{cleaned}")
-
-        try:
-            json_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-            if json_match:
-                alt_cleaned = json_match.group(0)
-                vehicle_data = json.loads(alt_cleaned)
-                print("✅ JSON parsed successfully with alternative method!")
-                return vehicle_data
-        except:
-            pass
-
-        return {"error": "Failed to parse response", "raw_response": response}
-
-
-def get_vehicle_text_chunks_from_html(html, chunk_size=2000):
-    """Extract relevant text from HTML and split into chunks."""
+@lru_cache(maxsize=100)
+def get_vehicle_text_from_html(html):
+    """Extract relevant text from HTML (cached for performance)."""
     soup = BeautifulSoup(html, "html.parser")
     sections = []
 
@@ -233,17 +199,7 @@ def get_vehicle_text_chunks_from_html(html, chunk_size=2000):
     if len(text.strip()) < 100:
         text = soup.get_text("\n", strip=True)
 
-    lines = text.split("\n")
-    chunks, buf = [], ""
-    for line in lines:
-        if len(buf) + len(line) + 1 <= chunk_size:
-            buf += line + "\n"
-        else:
-            chunks.append(buf)
-            buf = line + "\n"
-    if buf:
-        chunks.append(buf)
-    return chunks
+    return text
 
 
 def extract_vehicle_data_from_raw_text(raw_text, vehicle_id, vehicle_url):
@@ -251,7 +207,7 @@ def extract_vehicle_data_from_raw_text(raw_text, vehicle_id, vehicle_url):
     This function receives raw vehicle listing text and processes it to extract the relevant fields.
     It returns the structured data in the required JSON format using direct regex extraction.
     """
-    print(f"🔍 Extracting vehicle data using direct pattern matching...")
+    logger.info(f"🔍 Extracting vehicle data using direct pattern matching...")
 
     make = "Unknown"
     model = "Unknown"
@@ -571,106 +527,8 @@ def extract_vehicle_data_from_raw_text(raw_text, vehicle_id, vehicle_url):
         },
     }
 
-    print(f"✅ Vehicle #{vehicle_id}: Direct extraction completed")
+    logger.info(f"✅ Vehicle #{vehicle_id}: Direct extraction completed")
     return vehicle_data
-
-
-def extract_with_flan(vehicle_id, vehicle_url, text):
-    """
-    Use local FLAN-T5 model to dynamically extract structured vehicle data as JSON.
-    Works without API keys.
-    """
-    prompt = f"""
-    Extract vehicle information and return ONLY a valid JSON object. No explanations, no markdown, no extra text.
-
-    JSON format:
-    {{
-    "id": {vehicle_id},
-    "make": "Unknown",
-    "model": "Unknown",
-    "year": 0,
-    "price": 0.0,
-    "mileage": 0,
-    "color": "Unknown",
-    "vin": "",
-    "stockNumber": "",
-    "condition": "new",
-    "detail_url": "{vehicle_url}",
-    "options": {{
-        "trim": "Unknown",
-        "bodyStyle": "",
-        "doors": "Unknown",
-        "engine": "Unknown",
-        "engineSize": "Unknown",
-        "horsepower": "Unknown",
-        "torque": "Unknown",
-        "transmission": "Unknown",
-        "drivetrain": "Unknown",
-        "fuelType": "Unknown",
-        "fuelCapacity": "Unknown",
-        "mpgCity": "Unknown",
-        "mpgHighway": "Unknown",
-        "seatingCapacity": "Unknown",
-        "cargoCapacity": "Unknown",
-        "wheelbase": "Unknown",
-        "length": "Unknown",
-        "width": "Unknown",
-        "height": "Unknown",
-        "curbWeight": "Unknown",
-        "groundClearance": "Unknown",
-        "safetyFeatures": [],
-        "techFeatures": [],
-        "interiorFeatures": [],
-        "exteriorFeatures": [],
-        "performanceFeatures": [],
-        "standardEquipment": [],
-        "optionalEquipment": []
-    }}
-    }}
-
-    Rules: Use double quotes, use "Unknown" for missing strings, 0 for missing numbers, empty arrays for missing lists, return only JSON.
-
-    Vehicle listing text:
-    {text}
-    """
-
-    inputs = tokenizer(
-        prompt, return_tensors="pt", truncation=True, max_length=1024
-    ).to(device)
-    outputs = model.generate(
-        **inputs, max_length=1024, num_beams=2, early_stopping=True
-    )
-    decoded = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-
-    try:
-        data = query_flant5(prompt)
-        if "error" not in data:
-            print(f"✅ Vehicle #{vehicle_id}: structured JSON parsed successfully")
-            return data
-        else:
-            raise Exception("JSON parsing failed")
-    except Exception:
-        print(f"⚠️ Vehicle #{vehicle_id}: Could not parse JSON, saving fallback text.")
-        print("Raw vehicle data:", text[:500])
-        return {"id": vehicle_id, "detail_url": vehicle_url, "raw_text": text[:500]}
-
-
-def merge_vehicle_data(results):
-    """Merge partial vehicle data chunks safely."""
-    if not results:
-        return None
-
-    valid = [r for r in results if isinstance(r, dict)]
-    if not valid:
-        return None
-
-    merged = valid[0].copy()
-
-    for data in valid[1:]:
-        for key, val2 in data.items():
-            if key not in merged or not merged[key]:
-                merged[key] = val2
-    return merged
 
 
 def get_next_page_url(html, base_url):
@@ -705,7 +563,7 @@ def get_next_page_url(html, base_url):
             if next_element and next_element.get("href"):
                 next_url = urljoin(base_url, next_element["href"])
                 if next_url != base_url and next_url != base_url.rstrip("/"):
-                    print(f"🔗 Found next page using selector '{selector}': {next_url}")
+                    logger.info(f"🔗 Found next page using selector '{selector}': {next_url}")
                     return next_url
         except Exception as e:
             continue
@@ -735,7 +593,7 @@ def get_next_page_url(html, base_url):
 
                 if current_page_num and page_num == current_page_num + 1:
                     next_url = urljoin(base_url, href)
-                    print(f"🔗 Found next page using page number: {next_url}")
+                    logger.info(f"🔗 Found next page using page number: {next_url}")
                     return next_url
             except:
                 continue
@@ -767,7 +625,7 @@ def get_next_page_url(html, base_url):
         except Exception as e:
             continue
 
-    print("❌ No next page found")
+    logger.debug("❌ No next page found")
     return None
 
 
@@ -901,14 +759,43 @@ def discover_additional_inventory_urls(base_url):
     return patterns
 
 
-def main_scraper(url, max_pages=50, max_categories=20):
+def process_single_vehicle(vehicle_url, vehicle_id):
+    """Process a single vehicle (for concurrent execution)."""
+    try:
+        logger.info(f"\n🚗 Processing vehicle #{vehicle_id}: {vehicle_url}")
+        
+        page_html = fetch_html_with_selenium(vehicle_url)
+        if not page_html:
+            logger.warning(f"Skipping {vehicle_url} due to load failure")
+            return None
+
+        raw_text = get_vehicle_text_from_html(page_html)
+        
+        logger.info(f"\n🚗 Extracting structured data...")
+        vehicle_data = extract_vehicle_data_from_raw_text(
+            raw_text, vehicle_id, vehicle_url
+        )
+
+        if vehicle_data:
+            logger.info("VEHICLE SCRAPED")
+            logger.debug(json.dumps(vehicle_data, indent=2, ensure_ascii=False))
+            return vehicle_data
+        
+        return None
+    except Exception as e:
+        logger.error(f"❌ Error processing vehicle {vehicle_url}: {e}")
+        return None
+
+
+def main_scraper(url, max_pages=50, max_categories=20, max_workers=MAX_WORKERS):
     """
     Enhanced main scraper with comprehensive pagination and category discovery
-
+    
     Args:
         url: Starting URL for the inventory page
         max_pages: Maximum number of pages to scrape per category (safety limit)
         max_categories: Maximum number of categories to process (safety limit)
+        max_workers: Number of concurrent workers for vehicle processing
     """
     output_file = "vehicle_inventory.json"
     with open(output_file, "w", encoding="utf-8") as f:
@@ -920,13 +807,14 @@ def main_scraper(url, max_pages=50, max_categories=20):
     categories_to_process = [url]
     processed_categories = set()
 
-    print(f"🚀 Starting comprehensive inventory scraping...")
-    print(f"📊 Max pages per category: {max_pages}")
-    print(f"📊 Max categories to process: {max_categories}")
+    logger.info(f"🚀 Starting comprehensive inventory scraping...")
+    logger.info(f"📊 Max pages per category: {max_pages}")
+    logger.info(f"📊 Max categories to process: {max_categories}")
+    logger.info(f"⚡ Concurrent workers: {max_workers}")
 
-    print(f"\n{'='*60}")
-    print(f"🔍 DISCOVERING INVENTORY CATEGORIES")
-    print(f"{'='*60}")
+    logger.info(f"\n{\'=\'*60}")
+    logger.info(f"🔍 DISCOVERING INVENTORY CATEGORIES")
+    logger.info(f"{\'=\'*60}")
 
     initial_html = fetch_html_with_selenium(url)
     if initial_html:
@@ -938,19 +826,19 @@ def main_scraper(url, max_pages=50, max_categories=20):
 
         additional_patterns = discover_additional_inventory_urls(url)
         categories_to_process.extend(additional_patterns)
-        print(f"🎯 Added {len(additional_patterns)} additional URL patterns")
+        logger.info(f"🎯 Added {len(additional_patterns)} additional URL patterns")
 
         total_discovered = len(discovered_categories) + len(additional_patterns)
-        print(f"📊 Total categories to process: {total_discovered}")
+        logger.info(f"📊 Total categories to process: {total_discovered}")
         for i, cat in enumerate(categories_to_process[:15], 1):
-            print(f"  {i}. {cat}")
+            logger.info(f"  {i}. {cat}")
         if len(categories_to_process) > 15:
-            print(f"  ... and {len(categories_to_process) - 15} more")
+            logger.info(f"  ... and {len(categories_to_process) - 15} more")
 
     category_count = 0
     for category_url in categories_to_process:
         if category_count >= max_categories:
-            print(f"⚠️ Reached maximum category limit ({max_categories}). Stopping.")
+            logger.warning(f"⚠️ Reached maximum category limit ({max_categories}). Stopping.")
             break
 
         if category_url in processed_categories:
@@ -959,36 +847,36 @@ def main_scraper(url, max_pages=50, max_categories=20):
         category_count += 1
         processed_categories.add(category_url)
 
-        print(f"\n{'='*60}")
-        print(f"📂 PROCESSING CATEGORY {category_count}/{len(categories_to_process)}")
-        print(f"🌐 Category URL: {category_url}")
-        print(f"{'='*60}")
+        logger.info(f"\n{\'=\'*60}")
+        logger.info(f"📂 PROCESSING CATEGORY {category_count}/{len(categories_to_process)}")
+        logger.info(f"🌐 Category URL: {category_url}")
+        logger.info(f"{\'=\'*60}")
 
         page_number = 1
         current_page_url = category_url
         category_vehicles = 0
 
         while current_page_url and page_number <= max_pages:
-            print(f"\n📄 Processing page {page_number} of category {category_count}...")
-            print(f"🔗 URL: {current_page_url}")
+            logger.info(f"\n📄 Processing page {page_number} of category {category_count}...")
+            logger.info(f"🔗 URL: {current_page_url}")
 
             if current_page_url in processed_urls:
-                print(f"⚠️ URL already processed, skipping: {current_page_url}")
+                logger.warning(f"⚠️ URL already processed, skipping: {current_page_url}")
                 break
 
             processed_urls.add(current_page_url)
 
             inventory_html = fetch_html_with_selenium(current_page_url)
             if not inventory_html:
-                print(f"❌ Failed to load page: {current_page_url}")
+                logger.error(f"❌ Failed to load page: {current_page_url}")
                 break
 
-            print(f"🔍 Extracting vehicle links...")
+            logger.info(f"🔍 Extracting vehicle links...")
             vehicle_links = extract_vehicle_links(inventory_html, current_page_url)
-            print(f"🔗 Found {len(vehicle_links)} vehicle detail links")
+            logger.info(f"🔗 Found {len(vehicle_links)} vehicle detail links")
 
             if not vehicle_links:
-                print(f"⚠️ No vehicle links found, moving to next page")
+                logger.warning(f"⚠️ No vehicle links found, moving to next page")
                 next_page_url = get_next_page_url(inventory_html, current_page_url)
                 if next_page_url:
                     current_page_url = next_page_url
@@ -1000,54 +888,36 @@ def main_scraper(url, max_pages=50, max_categories=20):
             print(
                 f"\n🚗 Processing {len(vehicle_links)} vehicles from page {page_number}..."
             )
+            logger.info(f"⚡ Using {max_workers} concurrent workers for faster processing...")
 
-            for i, vehicle_url in enumerate(vehicle_links, start=1):
-                print(
-                    f"\n🚗 Processing vehicle {i}/{len(vehicle_links)}: {vehicle_url}"
-                )
+            # Process vehicles concurrently
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_url = {
+                    executor.submit(process_single_vehicle, vehicle_url, total_vehicles + i + 1): vehicle_url
+                    for i, vehicle_url in enumerate(vehicle_links)
+                }
+                
+                for future in as_completed(future_to_url):
+                    vehicle_data = future.result()
+                    if vehicle_data:
+                        with open(output_file, "a", encoding="utf-8") as f:
+                            if not first:
+                                f.write(",\n")
+                            f.write(json.dumps(vehicle_data, ensure_ascii=False, indent=2))
+                            first = False
+                        total_vehicles += 1
+                        category_vehicles += 1
+                        logger.info(f"  ✔ Saved vehicle #{total_vehicles}")
 
-                page_html = fetch_html_with_selenium(vehicle_url)
-                if not page_html:
-                    print(f"Skipping {vehicle_url} due to load failure")
-                    continue
-
-                html_chunks = get_vehicle_text_chunks_from_html(
-                    page_html, chunk_size=800
-                )
-                print(f"  → got {len(html_chunks)} chunks")
-
-                all_raw_text = ""
-                for chunk_num, chunk in enumerate(html_chunks, start=1):
-                    print(f"  Accumulating chunk {chunk_num}/{len(html_chunks)}...")
-                    all_raw_text += chunk + "\n"
-
-                print(f"\n🚗 Extracting structured data...")
-                vehicle_data = extract_vehicle_data_from_raw_text(
-                    all_raw_text, total_vehicles + 1, vehicle_url
-                )
-
-                if vehicle_data:
-                    print("VEHICLE SCRAPED")
-                    print(json.dumps(vehicle_data, indent=2, ensure_ascii=False))
-
-                    with open(output_file, "a", encoding="utf-8") as f:
-                        if not first:
-                            f.write(",\n")
-                        f.write(json.dumps(vehicle_data, ensure_ascii=False, indent=2))
-                        first = False
-                    total_vehicles += 1
-                    category_vehicles += 1
-                    print(f"  ✔ Saved vehicle #{total_vehicles}")
-
-            print(f"\n🔍 Looking for next page in category...")
+            logger.info(f"\n🔍 Looking for next page in category...")
             next_page_url = get_next_page_url(inventory_html, current_page_url)
 
             if next_page_url:
-                print(f"✅ Found next page: {next_page_url}")
+                logger.info(f"✅ Found next page: {next_page_url}")
                 current_page_url = next_page_url
                 page_number += 1
             else:
-                print(f"❌ No more pages found in this category.")
+                logger.error(f"❌ No more pages found in this category.")
                 break
 
         print(
@@ -1057,13 +927,13 @@ def main_scraper(url, max_pages=50, max_categories=20):
     with open(output_file, "a", encoding="utf-8") as f:
         f.write("]\n")
 
-    print(f"\n{'='*60}")
-    print(f"✅ COMPREHENSIVE SCRAPING COMPLETE!")
-    print(f"📊 Total categories processed: {category_count}")
-    print(f"📊 Total pages processed: {len(processed_urls)}")
-    print(f"🚗 Total vehicles scraped: {total_vehicles}")
-    print(f"💾 Data saved to: {output_file}")
-    print(f"{'='*60}")
+    logger.info(f"\n{\'=\'*60}")
+    logger.info(f"✅ COMPREHENSIVE SCRAPING COMPLETE!")
+    logger.info(f"📊 Total categories processed: {category_count}")
+    logger.info(f"📊 Total pages processed: {len(processed_urls)}")
+    logger.info(f"🚗 Total vehicles scraped: {total_vehicles}")
+    logger.info(f"💾 Data saved to: {output_file}")
+    logger.info(f"{\'=\'*60}")
 
 
 if __name__ == "__main__":
@@ -1071,4 +941,5 @@ if __name__ == "__main__":
         "https://www.diamondvalleyhonda.com/new-inventory/index.htm",
         max_pages=50,
         max_categories=20,
+        max_workers=3,  # Adjust based on your system resources
     )
