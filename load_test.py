@@ -155,7 +155,7 @@ def print_progress(current, total, start_time):
     elapsed = time.time() - start_time
     percentage = (current / total) * 100
     bar_length = 50
-    filled = int(bar_length * current / total)
+    filled = int(    * current / total)
     bar = '█' * filled + '░' * (bar_length - filled)
     
     rps = current / elapsed if elapsed > 0 else 0
