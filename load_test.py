@@ -18,8 +18,8 @@ import statistics
 # ============================================================================
 
 # Server configuration
-BASE_URL = "http://localhost:8000"  # Change to your server URL
-API_ENDPOINT = "/api/v1/customer-app/business-categories/"  # Change to your endpoint
+BASE_URL = "https://salon.stylz.me"  # Salon Stylz API
+API_ENDPOINT = "/api/v1/shop/branches/create/"  # Branch creation endpoint
 
 # Load test configuration
 TOTAL_REQUESTS = 10000
@@ -27,12 +27,28 @@ CONCURRENT_WORKERS = 100  # Number of concurrent threads
 TIMEOUT = 30  # Request timeout in seconds
 
 # Request configuration
-REQUEST_METHOD = "GET"  # GET, POST, PUT, DELETE
+REQUEST_METHOD = "POST"  # POST method for creating branches
 REQUEST_HEADERS = {
     "Content-Type": "application/json",
-    "User-Agent": "LoadTester/1.0"
+    "User-Agent": "LoadTester/1.0",
+    # Add authentication token if required
+    # "Authorization": "Bearer YOUR_TOKEN_HERE"
 }
-REQUEST_BODY = {}  # For POST/PUT requests
+
+# Sample request body based on API schema
+REQUEST_BODY = {
+    "branch_name_en": "string",
+    "branch_name_ar": "string",
+    "notification_en": "string",
+    "notification_ar": "string",
+    "lat": "31.5204",
+    "lng": "74.3587",
+    "country_code": "+92",
+    "city": "string",
+    "address": "string",
+    "phone": "03001234567",
+    "business_category": 0
+}  # For POST/PUT requests
 
 # ============================================================================
 # STATISTICS TRACKING
@@ -155,7 +171,7 @@ def print_progress(current, total, start_time):
     elapsed = time.time() - start_time
     percentage = (current / total) * 100
     bar_length = 50
-    filled = int(    * current / total)
+    filled = int(bar_length * current / total)
     bar = '█' * filled + '░' * (bar_length - filled)
     
     rps = current / elapsed if elapsed > 0 else 0
